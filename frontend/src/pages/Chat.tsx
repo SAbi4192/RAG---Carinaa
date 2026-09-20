@@ -104,7 +104,18 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
   const [variants, setVariants] = useState<Record<number, Variant | null>>({});
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
-  const [askError, setAskError] = useState("");
+  /**
+   * The last failure, kept as a structure rather than a string.
+   *
+   * `code` lets the UI respond to WHAT went wrong - an ambiguous document gets a
+   * chooser, a missing local model gets a pointer to Settings - instead of matching
+   * on message text, which breaks as soon as the wording is edited.
+   */
+  const [askError, setAskError] = useState<{
+    message: string;
+    code: string;
+    detail: Record<string, unknown>;
+  } | null>(null);
 
   // Retrieval overrides
   const [mode, setMode] = useState<"online" | "offline">("online");
@@ -203,6 +214,45 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
   useEffect(() => {
     if (!learning && pipelineMode === "full") setPipelineMode("side");
   }, [learning, pipelineMode]);
+
+  /**
+   * Learning Mode opens its own panel when a question runs.
+   *
+   * The panel IS the feature - asking someone to turn it on after they have already
+   * chosen Learning Mode is a step with no purpose. Only "hidden" is overridden: a
+   * user who has maximised the pipeline has made an explicit choice, and collapsing
+   * it back would undo their decision.
+   */
+  useEffect(() => {
+    if (!learning) return;
+    if (asking && pipelineMode === "hidden") setPipelineMode("side");
+  }, [learning, asking, pipelineMode]);
+
+  /**
+   * Whether the Learning walkthrough is still animating.
+   *
+   * In Learning Mode the newest answer is withheld until the pipeline finishes, so the
+   * user watches it being built rather than reading it while stages are still
+   * appearing.
+   *
+   * THE SAFETY TIMEOUT IS NOT OPTIONAL. The animation is a presentation layer; the
+   * answer is the product. If the panel never reports completion - a bug, a crash, a
+   * stuck timer - the answer must still appear. So a hard ceiling reveals it
+   * regardless, and a Skip button in the panel ends the wait immediately.
+   */
+  const [pipelinePlaying, setPipelinePlaying] = useState(false);
+  const [revealDeadlinePassed, setRevealDeadlinePassed] = useState(false);
+
+  useEffect(() => {
+    if (!pipelinePlaying) {
+      setRevealDeadlinePassed(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setRevealDeadlinePassed(true), 7000);
+    return () => window.clearTimeout(timer);
+  }, [pipelinePlaying]);
+
+  const holdNewestAnswer = learning && pipelinePlaying && !revealDeadlinePassed;
 
   /**
    * Uploading from chat.
@@ -451,7 +501,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       if (!trimmed || !activeId || asking) return;
 
       setAsking(true);
-      setAskError("");
+      setAskError(null);
       setQuestion("");
 
       // Show the user's turn immediately. This is an optimistic render of text
@@ -517,9 +567,18 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
         conversations.reload();
 
         if (result.message.used_fallback) {
+          // Transient by design: the fact is also on the provider badge, which
+          // never disappears, so nothing is lost when this clears. The wording
+          // names the provider that actually answered rather than a hard-coded
+          // one - "so Groq answered instead" was wrong whenever Gemini fell back
+          // to something else.
+          // `provider_label` is already human-formatted by the backend
+          // (e.g. "Groq · Fallback"), so there is nothing to capitalise here.
+          const actual = result.provider_label || "the fallback provider";
           toast.warning(
-            "Answered by the fallback provider",
-            "The primary provider was unavailable, so Groq answered instead. This is labelled on the answer.",
+            `Answered by ${actual}`,
+            "The primary provider was unavailable. This is labelled on the answer.",
+            2500,
           );
         }
       } catch (cause) {
@@ -530,14 +589,23 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
         const message =
           cause instanceof ApiError ? cause.message : "The question could not be answered.";
 
-        if (cause instanceof ApiError && cause.code === "local_model_unavailable") {
-          setAskError(
-            "The local model is not loaded, so offline mode cannot answer. Open Settings and load it, or switch to online mode.",
-          );
+        if (cause instanceof ApiError) {
+          setAskError({
+            message:
+              cause.code === "local_model_unavailable"
+                ? "The local model is not loaded, so offline mode cannot answer. Open Settings and load it, or switch to online mode."
+                : cause.message,
+            code: cause.code,
+            detail: cause.detail ?? {},
+          });
         } else {
-          setAskError(message);
+          setAskError({ message, code: "error", detail: {} });
         }
-        toast.error("Could not answer that", message);
+
+        // A clarification is not a failure, so it does not get an error toast.
+        if (!(cause instanceof ApiError && cause.code === "ambiguous_document")) {
+          toast.error("Could not answer that", message);
+        }
       } finally {
         setAsking(false);
       }
@@ -563,7 +631,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     setMessages([]);
     setGroundings({});
     setVariants({});
-    setAskError("");
+    setAskError(null);
     setQuestion("");
     navigate("/app/chat");
     setMobileListOpen(false);
@@ -920,6 +988,20 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                   </div>
                 ) : (
                   messages.map((message) => (
+                    /* In Learning Mode the newest answer waits for the walkthrough.
+                       It is replaced by a placeholder rather than left blank, so the
+                       gap reads as "still being built" instead of "nothing happened". */
+                    holdNewestAnswer && message.id === lastAssistantId ? (
+                      <div
+                        key={message.id}
+                        className="flex items-center gap-3 rounded-2xl border border-brand/25 bg-brand/6 px-4 py-3.5"
+                      >
+                        <Spinner size={14} />
+                        <span className="text-xs text-muted">
+                          Building the answer — watch the pipeline on the right.
+                        </span>
+                      </div>
+                    ) : (
                     <MessageBubble
                       key={message.id}
                       message={message}
@@ -932,6 +1014,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                       }
                       onOpenTrace={() => setTraceFor(message.id)}
                     />
+                    )
                   ))
                 )}
 
@@ -948,11 +1031,48 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 ) : null}
 
                 {askError ? (
-                  <ErrorState
-                    title="That question could not be answered"
-                    message={askError}
-                    onRetry={() => void ask(question || "")}
-                  />
+                  askError.code === "ambiguous_document" ? (
+                    /* A clarification, not an error. The backend refused because a
+                       page number means nothing across several documents, and it
+                       told us the candidates - so offer them rather than making the
+                       user retype their question with a filename in it. */
+                    <div className="rounded-xl border border-caution/30 bg-caution/8 p-4">
+                      <p className="text-xs font-medium text-ink">
+                        Which document did you mean?
+                      </p>
+                      <p className="mt-1 text-2xs leading-relaxed text-muted">
+                        This chat has more than one document in scope, and a page number
+                        alone does not say which one to look in.
+                      </p>
+                      <div className="mt-2.5 flex flex-wrap gap-1.5">
+                        {((askError.detail?.candidates as string[]) ?? []).map((name) => (
+                          <button
+                            key={name}
+                            type="button"
+                            onClick={() =>
+                              void ask(`${question} (in ${name})`)
+                            }
+                            className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-2xs font-medium text-ink transition hover:border-brand/40 hover:text-brand"
+                          >
+                            {name}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAskError(null)}
+                        className="mt-2 text-2xs text-faint transition hover:text-ink"
+                      >
+                        dismiss
+                      </button>
+                    </div>
+                  ) : (
+                    <ErrorState
+                      title="That question could not be answered"
+                      message={askError.message}
+                      onRetry={() => void ask(question || "")}
+                    />
+                  )
                 ) : null}
               </div>
             </div>
@@ -1113,6 +1233,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 totalMs={latestTrace?.total_ms}
                 running={asking}
                 onClose={() => setPipelineMode("hidden")}
+                onPlayingChange={setPipelinePlaying}
               />
             </aside>
           ) : null}
@@ -1141,6 +1262,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                   totalMs={latestTrace?.total_ms}
                   running={asking}
                   onClose={() => setPipelineMode("side")}
+                  onPlayingChange={setPipelinePlaying}
                 />
               </div>
             </div>

@@ -7,7 +7,9 @@ import {
   ChevronRight,
   Eye,
   EyeOff,
+  FileText,
   Lightbulb,
+  MessageSquare,
   MinusCircle,
   RotateCcw,
   SkipForward,
@@ -97,12 +99,22 @@ export function LearningPanel({
   totalMs,
   running,
   onClose,
+  onPlayingChange,
   className,
 }: {
   stages: TraceStage[];
   totalMs?: number;
   running?: boolean;
   onClose?: () => void;
+  /**
+   * Reports whether the walkthrough is still playing.
+   *
+   * Learning Mode uses this to reveal the answer when the animation reaches the end,
+   * so the user watches it being built rather than reading it while the stages are
+   * still appearing. Chat holds a hard timeout on the same state, so a failure here
+   * can never leave an answer hidden.
+   */
+  onPlayingChange?: (playing: boolean) => void;
   className?: string;
 }) {
   const [open, setOpen] = useState<string | null>(null);
@@ -145,6 +157,11 @@ export function LearningPanel({
   }, [signature, prefersReducedMotion]);
 
   useEffect(() => {
+    onPlayingChange?.(playing);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- callback identity varies
+  }, [playing]);
+
+  useEffect(() => {
     if (!playing) return;
     if (revealed >= stages.length) {
       setPlaying(false);
@@ -185,6 +202,58 @@ export function LearningPanel({
    * scope: "5 excerpts" means something different when 2 documents were searched
    * than when 12 were.
    */
+    /**
+   * Conversational context: whether this question needed earlier turns, and what it
+   * was resolved to. Read from the query_analysis stage, which the server annotates.
+   *
+   * Shown because "conversation memory" and "document retrieval" are easy to confuse,
+   * and a learner seeing both side by side understands that the chat history is not
+   * document evidence.
+   */
+  const conversation = useMemo(() => {
+    const stage = stages.find((item) => item.stage === "query_analysis");
+    const data = stage?.data;
+    if (!data?.is_followup) return null;
+    return {
+      original: String(data.original_question ?? ""),
+      resolved: String(data.resolved_question ?? ""),
+    };
+  }, [stages]);
+
+  /**
+   * A page reference the user made, and whether a filter was applied for it.
+   *
+   * Read from candidate_retrieval. `page_filter_applied` is the real filter value, so
+   * the UI reports what retrieval did rather than what the question asked for.
+   */
+  const pageReference = useMemo(() => {
+    const stage = stages.find((item) => item.stage === "candidate_retrieval");
+    const data = stage?.data;
+    if (!data?.page_reference) return null;
+    return {
+      phrase: String(data.page_reference),
+      applied: data.page_filter_applied ? Number(data.page_filter_applied) : null,
+      turns: data.conversation_turns_used ? Number(data.conversation_turns_used) : 0,
+    };
+  }, [stages]);
+
+  /**
+   * What the model actually received, split by kind.
+   *
+   * Both counts come from the trace: the conversation turns from candidate_retrieval,
+   * the excerpts from context_building. Neither is inferred.
+   */
+  const contextUsed = useMemo(() => {
+    const retrieval = stages.find((item) => item.stage === "candidate_retrieval");
+    const building = stages.find((item) => item.stage === "context_building");
+    const turns = Number(retrieval?.data?.conversation_turns_used ?? 0);
+    const excerpts = Number(
+      building?.data?.excerpts ?? building?.data?.excerpt_count ?? 0,
+    );
+    if (turns === 0 && excerpts === 0) return null;
+    return { turns, excerpts };
+  }, [stages]);
+
   const scope = useMemo(() => {
     const stage = stages.find((item) => item.stage === "candidate_retrieval");
     const data = stage?.data;
@@ -273,6 +342,93 @@ export function LearningPanel({
 
         {running && stages.length === 0 ? (
           <p className="text-2xs text-faint">Working through the pipeline…</p>
+        ) : null}
+
+        {/* ---- conversation context (§31) ---------------------------- */}
+        {conversation ? (
+          <div className="mb-4 rounded-xl border border-brand/25 bg-brand/6 p-3.5">
+            <p className="flex items-center gap-1.5 text-2xs font-medium text-ink">
+              <MessageSquare className="h-3.5 w-3.5 text-brand" />
+              Conversation context
+            </p>
+            <p className="mt-1.5 text-2xs leading-relaxed text-muted">
+              This question could not be understood on its own, so Carinaa used your
+              earlier messages to resolve it. Conversation history is not document
+              evidence — it is never cited.
+            </p>
+            <dl className="mt-2 space-y-1 text-2xs">
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-faint">You asked</dt>
+                <dd className="min-w-0 flex-1 text-ink">{conversation.original}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-faint">Resolved to</dt>
+                <dd className="min-w-0 flex-1 font-medium text-brand">
+                  {conversation.resolved}
+                </dd>
+              </div>
+            </dl>
+          </div>
+        ) : null}
+
+        {/* ---- page reference (§32) --------------------------------- */}
+        {pageReference ? (
+          <div className="mb-4 rounded-xl border border-line bg-sunken p-3.5">
+            <p className="flex items-center gap-1.5 text-2xs font-medium text-ink">
+              <FileText className="h-3.5 w-3.5 text-muted" />
+              Page reference
+            </p>
+            <p className="mt-1.5 text-2xs leading-relaxed text-muted">
+              You asked about <strong className="text-ink">{pageReference.phrase}</strong>.
+              {pageReference.applied ? (
+                <>
+                  {" "}
+                  Because a page is a structural property rather than a meaning, Carinaa
+                  filtered the search to page{" "}
+                  <strong className="text-ink">{pageReference.applied}</strong> instead of
+                  hoping the right page ranked highly.
+                </>
+              ) : (
+                " No page filter could be applied."
+              )}
+            </p>
+          </div>
+        ) : null}
+
+        {/* ---- context used (§34) ----------------------------------- */}
+        {contextUsed ? (
+          <div className="mb-4 rounded-xl border border-line bg-sunken p-3.5">
+            <p className="text-2xs font-medium text-ink">Context used</p>
+            <p className="mt-1 text-2xs leading-relaxed text-muted">
+              The model received two different kinds of context. Only one of them is
+              evidence.
+            </p>
+            <dl className="mt-2 space-y-1 text-2xs">
+              <div className="flex items-baseline justify-between gap-3">
+                <dt className="text-muted">
+                  Conversation context
+                  <span className="ml-1 text-faint">— earlier messages, not evidence</span>
+                </dt>
+                <dd className="shrink-0 font-mono text-ink">
+                  {contextUsed.turns > 0 ? `${contextUsed.turns} turns` : "none"}
+                </dd>
+              </div>
+              <div className="flex items-baseline justify-between gap-3">
+                <dt className="text-muted">
+                  Document context
+                  <span className="ml-1 text-faint">— retrieved excerpts, citable</span>
+                </dt>
+                <dd className="shrink-0 font-mono text-ink">
+                  {contextUsed.excerpts} excerpt{contextUsed.excerpts === 1 ? "" : "s"}
+                </dd>
+              </div>
+            </dl>
+            <p className="mt-2 border-t border-line pt-2 text-2xs leading-relaxed text-faint">
+              {contextUsed.turns > 0
+                ? "Both were sent to the model together, kept in separate labelled blocks so the conversation is never cited as a source."
+                : "No earlier messages were needed, so only the retrieved excerpts were sent."}
+            </p>
+          </div>
         ) : null}
 
         {/* ---- retrieval scope (§42, §43) --------------------------- */}

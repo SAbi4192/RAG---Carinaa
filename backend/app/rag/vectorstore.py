@@ -273,6 +273,8 @@ class VectorStore:
         query_embedding: np.ndarray,
         top_k: int = 5,
         document_ids: Sequence[int] | None = None,
+        page_number: int | None = None,
+        section: str | None = None,
     ) -> list[RetrievedChunk]:
         """Nearest-neighbour search, hard-scoped to one workspace.
 
@@ -286,7 +288,7 @@ class VectorStore:
             return []
 
         collection = self._ensure_collection()
-        where = self._scope_filter(workspace_id, document_ids)
+        where = self._scope_filter(workspace_id, document_ids, page_number, section)
 
         try:
             with self._lock:
@@ -306,26 +308,56 @@ class VectorStore:
         return self._to_retrieved(result, expected_workspace_id=workspace_id)
 
     def _scope_filter(
-        self, workspace_id: int, document_ids: Sequence[int] | None
+        self,
+        workspace_id: int,
+        document_ids: Sequence[int] | None,
+        page_number: int | None = None,
+        section: str | None = None,
     ) -> dict[str, Any]:
         """Build the Chroma `where` clause.
 
-        `workspace_id` is unconditional. `document_ids` only ever narrows within an
-        already-scoped workspace, so it can never be used to escape the boundary.
+        `workspace_id` is unconditional. `document_ids` and `page_number` only ever
+        narrow WITHIN an already-scoped workspace, so neither can be used to escape
+        the boundary.
+
+        Page matching accepts a chunk that STARTS on the page or ENDS on it. Chunks
+        can span a page boundary - a passage beginning on page 2 and finishing on
+        page 3 is legitimately part of both - and matching only `page_number` would
+        hide it from a question about page 3.
         """
-        clause: dict[str, Any] = {"workspace_id": int(workspace_id)}
+        conditions: list[dict[str, Any]] = [{"workspace_id": int(workspace_id)}]
+
         if document_ids:
             ids = [int(d) for d in document_ids]
             if len(ids) == 1:
-                clause = {"$and": [{"workspace_id": int(workspace_id)}, {"document_id": ids[0]}]}
+                conditions.append({"document_id": ids[0]})
             else:
-                clause = {
+                conditions.append({"document_id": {"$in": ids}})
+
+        if page_number is not None and page_number > 0:
+            target = int(page_number)
+            # A chunk COVERS a page when it starts at or before it and ends at or
+            # after it. Matching equality on either bound misses a chunk that spans
+            # the page - and a short document is one chunk spanning all of its pages,
+            # so this is the common case rather than an edge case.
+            conditions.append(
+                {
                     "$and": [
-                        {"workspace_id": int(workspace_id)},
-                        {"document_id": {"$in": ids}},
+                        {"page_number": {"$lte": target}},
+                        {"page_end": {"$gte": target}},
                     ]
                 }
-        return clause
+            )
+
+        if section:
+            # Exact match on the stored title. The caller matches the question against
+            # the real section list first and passes back the exact string, so this
+            # never has to guess at a fuzzy comparison the index cannot do.
+            conditions.append({"section": section})
+
+        if len(conditions) == 1:
+            return conditions[0]
+        return {"$and": conditions}
 
     def _to_retrieved(
         self, result: dict[str, Any], *, expected_workspace_id: int

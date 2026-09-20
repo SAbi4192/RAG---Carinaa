@@ -62,6 +62,12 @@ from app.rag.failsafe import build_extractive_answer
 from app.rag.grounding import GroundingResult, check_grounding
 from app.rag.prompts import build_generation_messages
 from app.rag.retriever import RetrievalOutcome, get_retriever
+from app.rag.units import expand_unit_reference
+from app.rag.understanding import (
+    build_rewrite_messages,
+    clean_rewrite,
+    needs_conversation_context,
+)
 from app.rag.trace import TraceRecorder
 
 logger = get_logger(__name__)
@@ -166,11 +172,67 @@ class RAGPipeline:
         web_sources: list[dict[str, Any]] | None = None,
         language: str = "en",
         trace: TraceRecorder | None = None,
+        history: list[dict[str, str]] | None = None,
+        page_number: int | None = None,
+        section: str | None = None,
+        understanding: dict[str, Any] | None = None,
     ) -> RAGAnswer:
         """Produce a grounded, cited answer."""
         started = time.perf_counter()
         trace = trace or TraceRecorder()
         result = RAGAnswer(question=question, answer="", mode=mode, trace=trace)
+
+        # =================================================================
+        # UNDERSTANDING  (before retrieval - it changes what we search for)
+        # =================================================================
+        # A follow-up like "what is my name?" or "explain the second one" cannot be
+        # answered, or even retrieved for, in isolation. This resolves it into a
+        # standalone question using the conversation.
+        #
+        # Retrieval uses the RESOLVED question; generation uses the ORIGINAL one
+        # plus the history. That way retrieval searches for something complete,
+        # while the answer is written from what the user actually typed.
+        resolved_question = question
+        rewrite_note = ""
+        # Detection and rewriting are separate facts. A follow-up that the model leaves
+        # unchanged is still a follow-up - "What is my name?" is self-contained as a
+        # string, yet only answerable from the conversation. Recording only rewrites
+        # would hide the cases where history was used but the wording did not change.
+        followup_detected = bool(
+            history and needs_conversation_context(question, len(history))
+        )
+        if followup_detected and mode == "online":
+            try:
+                rewrite_response = await self.adapter.generate(
+                    build_rewrite_messages(question, history),
+                    mode=mode,
+                    temperature=0.0,
+                    max_tokens=80,
+                )
+                candidate = clean_rewrite(rewrite_response.text, question)
+                if candidate and candidate.strip() != question.strip():
+                    resolved_question = candidate
+                    rewrite_note = "Question rewritten using the conversation."
+            except Exception as exc:  # noqa: BLE001 - a failed rewrite is not fatal
+                # Deliberately broad: ANY problem here must degrade to the original
+                # question rather than fail the request. The user asked a question;
+                # a helper step going wrong is not their problem.
+                logger.warning("Query rewrite skipped: %s", exc.__class__.__name__)
+
+        # A unit reference is expanded rather than filtered. Section metadata is only
+        # as complete as the document's headings - a document can have sections for
+        # UNIT I, IV and V and none for II or III - so searching the CONTENT for the
+        # canonical form works where a filter would find nothing.
+        unit_note = ""
+        if resolved_question:
+            expanded, unit_note = expand_unit_reference(resolved_question)
+            if unit_note:
+                resolved_question = expanded
+
+        if resolved_question != question:
+            result.question = resolved_question
+
+
 
         # =================================================================
         # RETRIEVAL  (blocking work, so it runs off the event loop)
@@ -180,9 +242,11 @@ class RAGPipeline:
                 self.retriever.retrieve,
                 db,
                 workspace_id=workspace_id,
-                question=question,
+                question=resolved_question,
                 top_k=top_k,
                 candidate_k=candidate_k,
+                page_number=page_number,
+                section=section,
                 document_ids=document_ids,
                 use_rerank=use_rerank,
                 trace=trace,
@@ -231,6 +295,7 @@ class RAGPipeline:
                 build_generation_messages(
                     question,
                     prompt_excerpts,
+                    history=history,
                     language=language,
                     web_sources=web_sources,
                     # Offline gets a shorter prompt written for the 3B local model.
@@ -343,6 +408,37 @@ class RAGPipeline:
             )
         result.grounding = grounding
 
+        # Annotate the trace once the run is complete. This has to happen HERE, not
+        # earlier: `query_analysis` is recorded during retrieval, so writing to it
+        # before the pipeline ran silently did nothing - the event did not exist yet
+        # and the note was lost without any error.
+        # Every query-understanding annotation is applied HERE, together.
+        #
+        # Writing them earlier silently did nothing: `query_analysis` is recorded during
+        # retrieval, so before the pipeline runs there is no event to annotate. The
+        # notes were computed correctly and then dropped without any error - which is
+        # why the trace showed a resolved question as None while the answer was right.
+        understanding_notes: dict[str, Any] = {}
+        if followup_detected:
+            understanding_notes.update(
+                {
+                    "original_question": question,
+                    "resolved_question": resolved_question,
+                    "is_followup": True,
+                    "rewrite_reason": rewrite_note
+                    or "The question needed the conversation; it was already "
+                    "self-contained so the wording was left unchanged.",
+                }
+            )
+        if unit_note:
+            understanding_notes["unit_reference"] = unit_note
+
+        if understanding_notes:
+            for event in trace.events:
+                if event.stage == "query_analysis":
+                    event.data.update(understanding_notes)
+                    break
+
         result.total_ms = int((time.perf_counter() - started) * 1000)
         return result
 
@@ -368,6 +464,8 @@ async def retrieve_only(
     top_k: int | None = None,
     candidate_k: int | None = None,
     document_ids: Sequence[int] | None = None,
+    page_number: int | None = None,
+    section: str | None = None,
     use_rerank: bool | None = None,
 ) -> dict[str, Any]:
     """Run retrieval and context building, but never call an LLM.
@@ -384,6 +482,8 @@ async def retrieve_only(
             db,
             workspace_id=workspace_id,
             question=question,
+            page_number=page_number,
+            section=section,
             top_k=top_k,
             candidate_k=candidate_k,
             document_ids=document_ids,

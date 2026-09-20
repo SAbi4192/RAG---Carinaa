@@ -379,6 +379,76 @@ def main() -> int:
         "no API-key patterns found in the trace payload",
     )
 
+    # ------------------------------------------------- conversation memory
+    #
+    # Deliberately a question the DOCUMENTS cannot answer: the workspace contains
+    # cloud-computing notes and says nothing about anyone's name. So a correct reply
+    # proves the answer came from the conversation, not from retrieval that happened
+    # to contain the word.
+    print(f"\n{INFO} Conversation memory")
+    memory_name = "Abishek"
+    status, conversation = client.request(
+        "POST",
+        "/api/conversations",
+        json_body={"workspace_id": workspace_id, "title": "Memory check"},
+    )
+    if status != 201:
+        check("Create a conversation for the memory check", False, f"HTTP {status}")
+    else:
+        conversation_id = conversation["id"]
+
+        status, _ = client.request(
+            "POST",
+            "/api/chat/ask",
+            json_body={
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "question": f"My name is {memory_name} and I am working on a RAG project.",
+                "mode": args.mode,
+            },
+            timeout=900.0,
+        )
+        check("Memory: the introducing message was answered", status == 200, f"HTTP {status}")
+
+        status, recalled = client.request(
+            "POST",
+            "/api/chat/ask",
+            json_body={
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "question": "What is my name?",
+                "mode": args.mode,
+            },
+            timeout=900.0,
+        )
+        answer_text = (recalled or {}).get("answer", "") if status == 200 else ""
+        check(
+            "Memory: the name is recalled from earlier in the conversation",
+            status == 200 and memory_name.lower() in answer_text.lower(),
+            f"asked 'What is my name?' -> {answer_text[:140]!r}",
+        )
+
+        # A question the documents DO answer must still be answered from them, even
+        # with a conversation in progress - memory must not displace retrieval.
+        status, grounded = client.request(
+            "POST",
+            "/api/chat/ask",
+            json_body={
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id,
+                "question": "What is a hypervisor?",
+                "mode": args.mode,
+            },
+            timeout=900.0,
+        )
+        grounded_text = (grounded or {}).get("answer", "") if status == 200 else ""
+        citations = (grounded or {}).get("citations", []) if status == 200 else []
+        check(
+            "Memory does not displace document retrieval",
+            status == 200 and "hypervisor" in grounded_text.lower() and len(citations) > 0,
+            f"{len(citations)} citation(s), {grounded_text[:100]!r}",
+        )
+
     # ------------------------------------------------- grounded refusal test
     status, refusal = client.request(
         "POST",

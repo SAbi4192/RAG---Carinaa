@@ -228,6 +228,8 @@ class Retriever:
         top_k: int | None = None,
         candidate_k: int | None = None,
         document_ids: Sequence[int] | None = None,
+        page_number: int | None = None,
+        section: str | None = None,
         use_rerank: bool | None = None,
         trace: TraceRecorder | None = None,
     ) -> RetrievalOutcome:
@@ -279,6 +281,8 @@ class Retriever:
                 query_embedding=query_vector,
                 top_k=candidate_k,
                 document_ids=document_ids,
+                page_number=page_number,
+                section=section,
             )
         except Exception as exc:
             logger.exception("Retrieval failed for workspace %s", workspace_id)
@@ -300,6 +304,8 @@ class Retriever:
                     "candidates_returned": len(candidates),
                     "distance_metric": "cosine",
                     "document_filter": list(document_ids) if document_ids else None,
+                    "page_filter": page_number,
+                    "section_filter": section,
                     "workspace_filter_applied": True,
                 },
             )
@@ -549,6 +555,25 @@ class Retriever:
         kept.sort(key=lambda c: c.score, reverse=True)
         return kept, removed
 
+    def _assert_workspace_has_documents(self, db: Session, workspace_id: int) -> None:
+        """Distinguish "nothing matched" from "there is nothing to match against".
+
+        These are very different for the user: one means "rephrase your question",
+        the other means "upload a document first".
+
+        Reached whenever retrieval returns no candidates - which includes a page
+        filter that matched nothing, so a question about a page with no indexed
+        content produces a clear message rather than a confusing empty answer.
+        """
+        count = db.scalar(
+            select(Chunk.id).where(Chunk.workspace_id == workspace_id).limit(1)
+        )
+        if count is None:
+            raise NoWorkspaceDocuments(
+                "This workspace has no indexed documents yet. Upload a document first, "
+                "then ask your question."
+            )
+
 
 # Guards for the containment rule. `shared >= 6` stops two chunks that merely share
 # a few common words from being collapsed; `containment >= 0.92` means the shorter
@@ -561,21 +586,6 @@ def _content_word_set(text: str) -> frozenset[str]:
     """Words lowercased and stripped to alphanumerics, so `user-persona` and
     `user persona` collapse to the same token."""
     return frozenset(re.findall(r"[a-z0-9]+", (text or "").lower()))
-
-    def _assert_workspace_has_documents(self, db: Session, workspace_id: int) -> None:
-        """Distinguish 'nothing matched' from 'there is nothing to match against'.
-
-        These are very different for the user: one means "rephrase your question",
-        the other means "upload a document first".
-        """
-        count = db.scalar(
-            select(Chunk.id).where(Chunk.workspace_id == workspace_id).limit(1)
-        )
-        if count is None:
-            raise NoWorkspaceDocuments(
-                "This workspace has no indexed documents yet. Upload a document first, "
-                "then ask your question."
-            )
 
 
 def get_retriever() -> Retriever:

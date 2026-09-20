@@ -38,7 +38,7 @@ interface ToastContextValue {
   push: (tone: ToastTone, title: string, description?: string) => void;
   success: (title: string, description?: string) => void;
   error: (title: string, description?: string) => void;
-  warning: (title: string, description?: string) => void;
+  warning: (title: string, description?: string, durationMs?: number) => void;
   info: (title: string, description?: string) => void;
   dismiss: (id: number) => void;
 }
@@ -70,9 +70,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const push = useCallback(
-    (tone: ToastTone, title: string, description?: string) => {
+    (tone: ToastTone, title: string, description?: string, durationMs?: number) => {
       const id = nextId++;
       setToasts((current) => [...current.slice(-4), { id, tone, title, description }]);
+
+      // An explicit duration always wins - some notices are informational and
+      // should clear themselves, even though their tone would normally persist.
+      if (durationMs !== undefined) {
+        window.setTimeout(() => dismiss(id), durationMs);
+        return;
+      }
 
       // Success and info are self-evidently transient. Errors and warnings are
       // not: they usually require the user to change something.
@@ -90,7 +97,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       dismiss,
       success: (title, description) => push("success", title, description),
       error: (title, description) => push("error", title, description),
-      warning: (title, description) => push("warning", title, description),
+      warning: (title, description, durationMs) =>
+        push("warning", title, description, durationMs),
       info: (title, description) => push("info", title, description),
     }),
     [toasts, push, dismiss],

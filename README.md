@@ -11,15 +11,44 @@ component is documented with What / Why / How / Where / What-if-removed / How-to
 
 ---
 
+## It is a conversation, not a search box
+
+Carinaa remembers the chat and understands what a question is pointing at.
+
+- **Conversation memory.** "My name is Abishek" then, several messages later, "What is
+  my name?" answers correctly. Retrieval uses a rewritten standalone question;
+  generation uses your original words plus the history, kept in a separate block
+  labelled as conversation rather than document evidence - so a previous answer is
+  never cited as a source.
+- **Page references.** "Tell me about page 2", "the second page", "p.12" are detected
+  and applied as a metadata filter inside the vector index, not hoped for in the
+  ranking. A page that does not exist, a file with no pages, and an ambiguous document
+  each get their own accurate answer.
+- **Relative references.** "What about the next page?" resolves from the page the
+  conversation is already on.
+- **Section references.** "Tell me about the Interviewing Techniques section" matches
+  against the section titles actually indexed.
+- **Unit references.** "the third unit", "Unit III", "unit 3" and "unit five" all
+  resolve to the same thing. An embedding cannot bridge an ordinal to a Roman numeral —
+  that is a transformation, not a similarity — so the canonical form is added to the
+  search. This also works when the document's headings skip a unit, which filtering
+  would not.
+
+---
+
 ## Learn by watching it work
 
 The system is also a **RAG learning platform**. You do not have to take anyone's word for
 how it works — you can watch it, one stage at a time, on your own documents.
 
 - **Learning Mode** (a toggle in Chat) shows the real pipeline beneath every answer.
-- **The RAG Laboratory** (`/app/playground`) has seven benches — chunking, embeddings,
-  vector store, retrieval, context, generation and the full pipeline — each running the
-  same code the real pipeline runs.
+- **The RAG Laboratory** (`/app/playground`) has ten benches. Seven follow the stages of
+  one question — chunking, embeddings, vector store, retrieval, context, generation and
+  the full pipeline. Three more are about what a conversation adds on top: the
+  **Reference Lab** (why "page 2" must be a filter, not a search term), the **Scope Lab**
+  (how "answer only from this document" is enforced) and the **Memory Lab** (why the
+  question you type is not the question that gets searched). Each runs the same code the
+  real pipeline runs.
 - **The Full Pipeline bench** pauses, steps forward and steps back, for demonstrating at a
   lectern.
 
@@ -113,6 +142,13 @@ cd backend && ../.venv/Scripts/python.exe -m pytest -m slow
 # Every RAG Laboratory bench has working data behind it
 .venv/Scripts/python.exe scripts/verify_labs.py --mode online
 
+# Real-browser UI test: console errors, responsive widths, click-through
+.venv/Scripts/python.exe scripts/ui_test.py
+
+# Generate a small multi-page PDF for page-aware retrieval testing
+.venv/Scripts/python.exe scripts/make_test_pdf.py
+.venv/Scripts/python.exe scripts/ui_test.py --headed   # watch it run
+
 # Isolate one feature (translation + citation preservation)
 .venv/Scripts/python.exe scripts/probe_translate.py --mode online --language ta
 
@@ -124,8 +160,13 @@ cd frontend && node node_modules/typescript/bin/tsc --noEmit
 cd frontend && node node_modules/vite/bin/vite.js build
 ```
 
-**Current status: 121 pytest tests passing · E2E 43/43 online and 41/41 offline ·
-23/23 laboratory checks online and 22/22 offline · 6/6 security self-tests · 0 type drift.**
+**Current status: 216 pytest tests passing · E2E 44/44 · 23/23 laboratory checks ·
+45/45 browser UI checks with 0 console errors · 6/6 security self-tests · 0 type drift.**
+
+The browser test drives the real Edge already on the machine (`channel="msedge"`), so it
+needs no Playwright browser download. It checks every route for console errors and failed
+requests, exercises the chat and the panel controls, and verifies there is no horizontal
+overflow at 1440 / 1280 / 1024 / 768 / 390 px.
 
 The E2E script registers a throwaway account, so it never touches your data.
 

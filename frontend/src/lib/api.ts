@@ -421,6 +421,10 @@ export const api = {
       candidate_k?: number;
       document_ids?: number[];
       use_rerank?: boolean;
+      /** Structural filters, used by the Reference and Scope labs. */
+      page_number?: number;
+      section?: string;
+      conversation_id?: number;
     }) => request<RetrieveResponse>("/chat/retrieve", { method: "POST", body: payload }),
 
     trace: (messageId: number) => request<Trace>(`/messages/${messageId}/trace`),

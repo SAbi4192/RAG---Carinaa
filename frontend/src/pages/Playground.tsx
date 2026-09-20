@@ -8,6 +8,8 @@ import {
   MessageSquareText,
   Scissors,
   ScanSearch,
+  BookMarked,
+  MessagesSquare,
   Sparkles,
   Workflow,
 } from "lucide-react";
@@ -19,7 +21,10 @@ import ChunkingLab from "./labs/ChunkingLab";
 import ContextLab from "./labs/ContextLab";
 import EmbeddingLab from "./labs/EmbeddingLab";
 import GenerationLab from "./labs/GenerationLab";
+import MemoryLab from "./labs/MemoryLab";
 import PipelineLab from "./labs/PipelineLab";
+import ReferenceLab from "./labs/ReferenceLab";
+import ScopeLab from "./labs/ScopeLab";
 import RetrievalLab from "./labs/RetrievalLab";
 import VectorStoreLab from "./labs/VectorStoreLab";
 
@@ -106,6 +111,34 @@ const LABS: LabDefinition[] = [
     shows: "the whole system, one measured stage at a time",
     needsWorkspace: true,
   },
+  /* ---- conversational benches ------------------------------------------
+     The three above are stages of ONE question. These three are about what a
+     conversation adds on top: what the question refers to, what it is allowed to
+     search, and how it was understood from what came before. */
+  {
+    slug: "reference",
+    title: "Reference Lab",
+    blurb: "Ask about a page or a section and see the search change.",
+    icon: BookMarked,
+    shows: "why \"page 2\" has to be a filter rather than a search term",
+    needsWorkspace: true,
+  },
+  {
+    slug: "scope",
+    title: "Scope Lab",
+    blurb: "Limit retrieval to chosen documents and compare.",
+    icon: Layers,
+    shows: "how \"answer only from this document\" is enforced, not requested",
+    needsWorkspace: true,
+  },
+  {
+    slug: "memory",
+    title: "Memory Lab",
+    blurb: "Watch a follow-up question get resolved from the conversation.",
+    icon: MessagesSquare,
+    shows: "why the question you type is not the question that gets searched",
+    needsWorkspace: true,
+  },
 ];
 
 export default function Playground() {
@@ -130,6 +163,12 @@ export default function Playground() {
         return <GenerationLab />;
       case "pipeline":
         return <PipelineLab />;
+      case "reference":
+        return <ReferenceLab />;
+      case "scope":
+        return <ScopeLab />;
+      case "memory":
+        return <MemoryLab />;
       default:
         return <Navigate to="/app/playground" replace />;
     }
@@ -147,7 +186,7 @@ function LaboratoryDashboard() {
           RAG Laboratory
         </h1>
         <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted">
-          Seven benches, one per stage of the pipeline. Each one runs the{" "}
+          Ten benches: seven stages of the pipeline, plus three on how a conversation changes the search. Each one runs the{" "}
           <strong className="text-ink">same code the real pipeline runs</strong> — nothing here is
           a simulation, so what you measure is what the system does. Start with Chunking if you are
           new; the stages are listed in the order they execute.

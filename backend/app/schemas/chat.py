@@ -265,6 +265,11 @@ class RetrieveRequest(BaseModel):
     # ignore the scope the chat enforces, so the Retrieval Lab would show chunks
     # that a real answer could never use - the two views would disagree.
     conversation_id: int | None = None
+    # Optional structural filters, so the Reference and Scope labs can demonstrate
+    # them directly. These are the same filters /chat/ask applies, resolved the same
+    # way, so a lab result cannot differ from what a real answer would search.
+    page_number: int | None = Field(default=None, ge=1, le=10000)
+    section: str | None = None
 
 
 class RetrieveResponse(BaseModel):

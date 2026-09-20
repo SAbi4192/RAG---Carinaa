@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
 import {
+  AlertTriangle,
+  Check,
   CheckCircle2,
   ChevronDown,
   CircleSlash,
@@ -225,8 +227,140 @@ function StageRow({
   );
 }
 
+/**
+ * Merge a failed primary generation with the fallback that rescued it.
+ *
+ * A provider failure followed by a fallback is ONE event in the reader's mind - "the
+ * answer was generated, after a retry" - but it arrives as two `llm_generation` rows,
+ * which reads as two unrelated stages that both happen to be called the same thing.
+ * Worse, the second row looks like an unexplained duplicate.
+ *
+ * Grouping is deliberately narrow: it only fires when an ERROR generation is followed
+ * immediately by a SUCCESSFUL one with a different provider. Two successful generations
+ * from the same provider would be a real duplicate and should stay visible as such.
+ */
+export interface GenerationGroup {
+  kind: "generation-group";
+  primary: TraceStage;
+  fallback: TraceStage;
+}
+
+export type TraceEntry = TraceStage | GenerationGroup;
+
+export function groupStages(stages: TraceStage[]): TraceEntry[] {
+  const entries: TraceEntry[] = [];
+  let index = 0;
+
+  while (index < stages.length) {
+    const current = stages[index];
+    const next = stages[index + 1];
+
+    const isFailedPrimary =
+      current.stage === "llm_generation" && current.status === "error";
+    const isFallbackRecovery =
+      next?.stage === "llm_generation" &&
+      next.status === "ok" &&
+      String(next.data?.role ?? "") === "fallback";
+
+    if (isFailedPrimary && isFallbackRecovery) {
+      entries.push({ kind: "generation-group", primary: current, fallback: next });
+      index += 2;
+      continue;
+    }
+
+    entries.push(current);
+    index += 1;
+  }
+
+  return entries;
+}
+
+/**
+ * One row for a failed generation and the fallback that recovered from it.
+ *
+ * Drawn as a chain rather than two rows, because that is what happened: the primary was
+ * tried, it failed for a stated reason, and a different provider produced the answer.
+ * The failure and the recovery belong together - separated, the second row reads as an
+ * unexplained duplicate and the first as an error that apparently ended the run.
+ */
+function GenerationGroupRow({
+  group,
+  maxDuration,
+  index,
+}: {
+  group: GenerationGroup;
+  maxDuration: number;
+  index: number;
+}) {
+  const { primary, fallback } = group;
+  const total = primary.duration_ms + fallback.duration_ms;
+  const width = Math.max(2, Math.round((total / maxDuration) * 100));
+
+  const primaryProvider = String(primary.data?.provider ?? "the primary provider");
+  const fallbackProvider = String(fallback.data?.provider ?? "a fallback provider");
+  const reason = String(primary.data?.error ?? "unavailable");
+  const model = fallback.data?.model ? String(fallback.data.model) : null;
+
+  return (
+    <li className="rounded-lg border border-line bg-surface">
+      <div className="flex items-start gap-3 px-3 py-2.5">
+        <span className="w-5 shrink-0 pt-0.5 text-right font-mono text-2xs text-faint">
+          {index + 1}
+        </span>
+
+        <span className="mt-0.5 shrink-0 text-caution">
+          <AlertTriangle className="h-3.5 w-3.5" />
+        </span>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+            <span className="text-xs font-medium text-ink">
+              LLM Generation
+              <span className="ml-2 rounded border border-caution/40 bg-caution/10 px-1.5 py-px text-[0.625rem] font-normal text-caution">
+                recovered
+              </span>
+            </span>
+            <span className="font-mono text-2xs text-faint">{formatDuration(total)}</span>
+          </div>
+
+          {/* The chain. */}
+          <ol className="mt-1.5 space-y-0.5">
+            <li className="flex flex-wrap items-center gap-x-2 text-2xs">
+              <span className="text-ink">{primaryProvider}</span>
+              <span className="flex items-center gap-1 text-caution">
+                <AlertTriangle className="h-3 w-3" />
+                {reason}
+              </span>
+            </li>
+            <li className="pl-1 text-2xs text-faint" aria-hidden>
+              ↓
+            </li>
+            <li className="flex flex-wrap items-center gap-x-2 text-2xs">
+              <span className="text-ink">{fallbackProvider}</span>
+              <span className="flex items-center gap-1 text-positive">
+                <Check className="h-3 w-3" />
+                generated the response
+              </span>
+              <span className="font-mono text-faint">{formatDuration(fallback.duration_ms)}</span>
+            </li>
+          </ol>
+
+          {model ? (
+            <p className="mt-1 font-mono text-[0.625rem] text-faint">model: {model}</p>
+          ) : null}
+
+          <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-sunken">
+            <div className="h-full rounded-full bg-caution/60" style={{ width: `${width}%` }} />
+          </div>
+        </div>
+      </div>
+    </li>
+  );
+}
+
 export function TraceTimeline({ trace, className }: { trace: Trace; className?: string }) {
   const stages = trace.stages ?? [];
+  const entries = useMemo(() => groupStages(stages), [stages]);
 
   const maxDuration = useMemo(
     () => Math.max(...stages.map((stage) => stage.duration_ms), 1),
@@ -288,14 +422,23 @@ export function TraceTimeline({ trace, className }: { trace: Trace; className?: 
       </div>
 
       <ol className="space-y-1.5 px-5 py-4">
-        {stages.map((stage, index) => (
-          <StageRow
-            key={`${stage.seq}-${stage.stage}`}
-            stage={stage}
-            maxDuration={maxDuration}
-            index={index}
-          />
-        ))}
+        {entries.map((entry, index) =>
+          "kind" in entry ? (
+            <GenerationGroupRow
+              key={`group-${entry.primary.seq}`}
+              group={entry}
+              maxDuration={maxDuration}
+              index={index}
+            />
+          ) : (
+            <StageRow
+              key={`${entry.seq}-${entry.stage}`}
+              stage={entry}
+              maxDuration={maxDuration}
+              index={index}
+            />
+          ),
+        )}
       </ol>
 
       <div className="border-t border-line px-5 py-3">

@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Markdown } from "@/components/chat/Markdown";
 import { AnswerToolbar } from "@/components/chat/AnswerToolbar";
 import { CitationCard, GroundingBadge } from "@/components/chat/Citations";
+import { RefusalPanel } from "@/components/chat/RefusalPanel";
 
 /**
  * One turn in a conversation.
@@ -117,6 +118,16 @@ export function MessageBubble({
    * saw.
    */
   const scopeKind = retrieval.retrieval_scope ? String(retrieval.retrieval_scope) : null;
+
+  /**
+   * Whether this turn was a refusal rather than an answer.
+   *
+   * The grounding verdict is the source of truth: INSUFFICIENT_EVIDENCE is exactly the
+   * status the backend assigns when retrieval found nothing that supports the question.
+   * Deriving it from the verdict rather than from the answer text means the UI cannot
+   * disagree with the backend about whether a refusal happened.
+   */
+  const isRefusal = grounding?.status === "INSUFFICIENT_EVIDENCE";
   const scopeSearched = Number(retrieval.workspace_documents_searched ?? 0);
   const scopeAvailable = Number(retrieval.workspace_documents_available ?? 0);
 
@@ -230,11 +241,18 @@ export function MessageBubble({
               </div>
             ) : null}
           </div>
-        ) : (
+        ) : isRefusal ? null : (
           <p className="text-2xs text-faint">
             No sources were cited. Check the grounding verdict above before relying on this.
           </p>
         )}
+
+        {/* A refusal is correct behaviour, but it needs to be actionable. This
+            reports what actually happened - real counts, not a guess about the cause -
+            and suggests the specific next step. */}
+        {isRefusal ? (
+          <RefusalPanel message={message} grounding={grounding} />
+        ) : null}
 
         {/* ---- retrieval detail ---------------------------------- */}
         {candidateCount > 0 || topScore > 0 ? (

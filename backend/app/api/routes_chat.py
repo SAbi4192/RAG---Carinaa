@@ -35,6 +35,7 @@ from app.db.models import (
     AnswerVariant,
     Conversation,
     ConversationDocument,
+    Chunk,
     Document,
     Message,
     QueryLog,
@@ -43,6 +44,12 @@ from app.db.models import (
     utcnow,
 )
 from app.rag.pipeline import get_rag_pipeline, retrieve_only
+from app.rag.sections import detect_relative_section, match_section
+from app.rag.references import (
+    needs_document_clarification,
+    resolve_relative_page,
+)
+from app.rag.understanding import detect_page_reference
 from app.rag.trace import TraceRecorder, stage_definitions
 from app.schemas.chat import (
     AskRequest,
@@ -123,6 +130,92 @@ def _resolve_retrieval_scope(
         return explicit_ids
     scope = _conversation_scope(db, conversation_id)
     return scope or None
+
+
+# How many previous turns to give the model. Six is three exchanges - enough to
+# resolve "what is my name?" and "the second one", without pushing the retrieved
+# excerpts so far from the question that a small model starts answering from the
+# conversation instead of the documents.
+_HISTORY_TURNS = 6
+
+
+def _load_history(db: DbSession, conversation_id: int, limit: int = _HISTORY_TURNS) -> list[dict[str, str]]:
+    """The most recent turns of this conversation, oldest first.
+
+    Only user and assistant text. The assistant's answer is included because a
+    follow-up often refers to what Carinaa just said ("explain the second one"),
+    not only to what the user said.
+    """
+    rows = db.scalars(
+        select(Message)
+        .where(Message.conversation_id == conversation_id)
+        .order_by(Message.id.desc())
+        .limit(limit)
+    ).all()
+    return [
+        {"role": row.role, "content": row.content or ""}
+        for row in reversed(rows)
+        if row.role in ("user", "assistant") and (row.content or "").strip()
+    ]
+
+
+def _page_range(db: DbSession, scope: list[int] | None, workspace_id: int) -> tuple[int, int] | None:
+    """(min, max) page number available in scope, or None when there is no page data.
+
+    Used to answer "page 20 does not exist" honestly. Only reported when real
+    metadata confirms it - guessing a page count would be worse than saying nothing.
+    """
+    # `page_end` for the upper bound, not `page_number`. A short document becomes one
+    # chunk covering several pages, so its `page_number` is 1 while its `page_end` is
+    # the real last page. Using `page_number` for both bounds reported "pages 1 to 1"
+    # for a four-page document and rejected every page question.
+    query = select(
+        func.min(Chunk.doc_metadata["page_number"]),
+        func.max(Chunk.doc_metadata["page_end"]),
+    )
+    query = query.where(Chunk.workspace_id == workspace_id)
+    if scope:
+        query = query.where(Chunk.document_id.in_(list(scope)))
+    try:
+        lowest, highest = db.execute(query).one()
+    except Exception:  # noqa: BLE001 - metadata shape varies by file type
+        return None
+    if lowest is None or highest is None:
+        return None
+    return int(lowest), int(highest)
+
+
+def _scope_filenames(db: DbSession, scope: list[int] | None, workspace_id: int) -> list[str]:
+    """Filenames of the documents retrieval is allowed to search.
+
+    Used to decide whether a page question is ambiguous: "page 2" means nothing
+    across two documents, so with more than one in scope and none named, the honest
+    response is to ask which - not to pick one and answer confidently from it.
+    """
+    query = select(Document.original_filename).where(
+        Document.workspace_id == workspace_id, Document.status == "ready"
+    )
+    if scope:
+        query = query.where(Document.id.in_(list(scope)))
+    return [name for (name,) in db.execute(query).all() if name]
+
+
+def _scope_sections(db: DbSession, scope: list[int] | None, workspace_id: int) -> list[str]:
+    """Distinct section titles in the documents retrieval may search.
+
+    Section matching needs the REAL titles, because a section is a name that exists
+    only in the document - unlike a page, which is a number detectable from the
+    question alone. Reading them from the indexed metadata means the feature works on
+    whatever the documents actually contain, rather than on titles someone guessed at.
+    """
+    query = select(Chunk.doc_metadata["section"]).where(Chunk.workspace_id == workspace_id)
+    if scope:
+        query = query.where(Chunk.document_id.in_(list(scope)))
+    try:
+        rows = db.execute(query.distinct()).all()
+    except Exception:  # noqa: BLE001 - metadata shape varies by file type
+        return []
+    return sorted({str(value) for (value,) in rows if value})
 
 
 def _with_scope(
@@ -354,6 +447,84 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
     # REPORTED cannot drift apart.
     resolved_scope = _resolve_retrieval_scope(db, conversation.id, payload.document_ids)
 
+    # ---- understand the question ------------------------------------------
+    # A page reference is a STRUCTURAL constraint. Dense retrieval compares meaning,
+    # and "the second page" means nothing to it, so the constraint is applied as a
+    # filter rather than hoped for in the ranking.
+    requested_page, page_phrase, page_is_relative, page_direction = detect_page_reference(
+        payload.question
+    )
+
+    # A relative reference ("the next page") can only be resolved from what the
+    # conversation established. When nothing established a page, it stays
+    # unresolved rather than being guessed - and the question is answered as a
+    # normal question instead.
+    relative_note = ""
+    if page_is_relative:
+        resolved_page, relative_source = resolve_relative_page(
+            page_direction, _load_history(db, conversation.id)
+        )
+        if resolved_page is not None:
+            requested_page = resolved_page
+            relative_note = f"Resolved from {relative_source}."
+            page_is_relative = False
+
+    # Several documents in scope and none named makes "page 2" unanswerable.
+    # Asking is better than picking one, because a confident answer from the wrong
+    # document is worse than a clarifying question.
+    scope_names = _scope_filenames(db, resolved_scope, workspace.id)
+    ambiguous = needs_document_clarification(payload.question, requested_page, scope_names)
+    if ambiguous is not None:
+        raise CarinaaError(
+            "Which document did you mean? This chat has "
+            f"{len(ambiguous)} documents in scope, and a page number alone does not "
+            "say which one to look in.",
+            code="ambiguous_document",
+            status_code=400,
+            detail={"candidates": ambiguous, "requested_page": requested_page},
+        )
+
+    if requested_page is not None:
+        span = _page_range(db, resolved_scope, workspace.id)
+
+        if span is None:
+            # No page metadata anywhere in scope. That is different from a page
+            # being out of range: the document has no pages at all. Reporting
+            # "could not find it" here would imply the content is missing, when
+            # actually the question does not apply to this file type.
+            raise CarinaaError(
+                "The documents in scope have no page information, so a page number "
+                "does not apply. This happens with plain text, Markdown and CSV "
+                "files, which are not paginated. Ask about the content instead.",
+                code="no_page_metadata",
+                status_code=400,
+                detail={"requested_page": requested_page, "page_metadata": False},
+            )
+
+        if not (span[0] <= requested_page <= span[1]):
+            # Confirmed by real metadata, so say so plainly instead of running a
+            # search that cannot succeed and letting the model invent something.
+            # 400 with a precise message: the page range is real metadata, so this
+            # is a confident statement rather than a guess.
+            raise CarinaaError(
+                f"The documents in scope have pages {span[0]} to {span[1]}, so "
+                f"page {requested_page} does not exist.",
+                code="page_out_of_range",
+                status_code=400,
+                detail={
+                    "requested_page": requested_page,
+                    "available_pages": {"from": span[0], "to": span[1]},
+                },
+            )
+
+    # A section is a NAME, so matching runs against the titles actually indexed rather
+    # than being parsed out of the question. A question that names no real section
+    # falls through to ordinary retrieval.
+    section_match = match_section(payload.question, _scope_sections(db, resolved_scope, workspace.id))
+    section_is_relative = detect_relative_section(payload.question)
+
+    conversation_history = _load_history(db, conversation.id)
+
     # ---- run the pipeline -------------------------------------------------
     pipeline = get_rag_pipeline()
     result = await pipeline.answer(
@@ -368,6 +539,9 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         web_sources=web_sources or None,
         language=payload.language,
         trace=trace,
+        history=conversation_history,
+        page_number=requested_page,
+        section=section_match,
     )
 
     # ---- record what was actually searched (brief section 43) -------------
@@ -385,6 +559,25 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
     for event in trace.events:
         if event.stage != "candidate_retrieval":
             continue
+        if requested_page is not None:
+            event.data.update(
+                {
+                    "page_reference": page_phrase,
+                    "page_filter_applied": requested_page,
+                }
+            )
+            if relative_note:
+                event.data["page_resolution"] = relative_note
+        if section_match:
+            event.data["section_filter_applied"] = section_match
+        if section_is_relative:
+            # Detected but not resolved: the section the conversation is in is not
+            # something this layer knows, and guessing one would be worse than
+            # answering without the filter.
+            event.data["relative_section"] = section_is_relative
+        if conversation_history:
+            event.data["conversation_turns_used"] = len(conversation_history)
+
         if resolved_scope is None:
             event.data.update(
                 {
@@ -531,6 +724,13 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
             raise NotFound("That conversation is not in this workspace.")
         scope = _resolve_retrieval_scope(db, conversation.id, None)
 
+    # The same structural filters /chat/ask applies, so the labs demonstrate the real
+    # behaviour rather than an approximation of it.
+    requested_page = payload.page_number
+    if requested_page is None:
+        detected, _phrase, _relative, _direction = detect_page_reference(payload.question)
+        requested_page = detected
+
     outcome = await retrieve_only(
         db,
         workspace_id=workspace.id,
@@ -538,6 +738,8 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         top_k=payload.top_k,
         candidate_k=payload.candidate_k,
         document_ids=scope,
+        page_number=requested_page,
+        section=payload.section,
         use_rerank=payload.use_rerank,
     )
 
