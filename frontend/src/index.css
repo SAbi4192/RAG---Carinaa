@@ -1,0 +1,372 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   CARINAA DESIGN TOKENS
+   ==========================================================================
+
+   Every colour in the application resolves to one of these variables. That is a
+   deliberate architectural choice, not a stylistic one.
+
+   The requirement was that dark and light mode must BOTH feel like first-class
+   designs. The usual approach - one palette, mechanically inverted - fails that
+   test every time, because contrast, saturation and perceived elevation do not
+   invert cleanly. A violet that reads as confident on white reads as muddy on
+   near-black. A shadow that creates depth in light mode is invisible in dark mode,
+   where depth has to come from surface lightness instead.
+
+   So each variable is chosen TWICE, on purpose, for its own mode:
+
+     * Light mode gets a cool near-white canvas with pure-white cards and real
+       shadows. Elevation reads as "paper on a desk".
+     * Dark mode gets a deep blue-black canvas where elevation reads as "surface
+       catching light" - each layer is lighter than the one below it, and shadows
+       are reduced to near-nothing because darkness cannot cast a shadow.
+
+   Values are space-separated RGB channels, not hex. That is what lets Tailwind
+   compose them with an alpha channel: `rgb(var(--ink) / <alpha-value>)` means
+   `text-ink/60` works without a second variable.
+   ========================================================================== */
+
+:root,
+[data-theme="light"] {
+  /* ---- surfaces ------------------------------------------------------- */
+  --canvas: 250 250 252;        /* page background */
+  --surface: 255 255 255;       /* cards, panels */
+  --raised: 255 255 255;        /* popovers, modals - lifts via shadow */
+  --sunken: 244 244 248;        /* wells, code blocks, table stripes */
+
+  /* ---- borders -------------------------------------------------------- */
+  --line: 228 228 235;          /* default hairline */
+  --line-strong: 208 208 219;   /* emphasised divider, input border */
+
+  /* ---- text ----------------------------------------------------------- */
+  --ink: 22 22 29;              /* primary text - 15.8:1 on canvas */
+  --muted: 85 85 105;           /* secondary text - 7.4:1 */
+  --faint: 138 138 158;         /* tertiary, placeholders - 4.6:1 */
+
+  /* ---- brand ---------------------------------------------------------- */
+  --brand: 124 58 237;          /* violet - the Carinaa identity */
+  --brand-soft: 237 233 254;    /* tinted background for brand chips */
+  --brand-ink: 255 255 255;     /* text ON brand */
+
+  /* ---- accent --------------------------------------------------------- */
+  --accent: 13 148 136;         /* teal - used for trace/technical data */
+  --accent-soft: 204 251 241;
+
+  /* ---- semantic ------------------------------------------------------- */
+  --positive: 21 128 61;        /* SUPPORTED */
+  --caution: 180 83 9;          /* PARTIALLY_SUPPORTED */
+  --negative: 185 28 28;        /* CITATION_ERROR */
+  --info: 3 105 161;            /* INSUFFICIENT_EVIDENCE, neutral notices */
+
+  /* ---- shadow --------------------------------------------------------- */
+  --shadow: 15 23 42;           /* slate-900, used at low alpha */
+}
+
+[data-theme="dark"] {
+  /* Surfaces get LIGHTER as they come forward. This is the dark-mode
+     equivalent of a shadow, and it is why each step is +7 or so. */
+  --canvas: 11 11 16;
+  --surface: 19 19 27;
+  --raised: 27 27 37;
+  --sunken: 8 8 12;
+
+  --line: 38 38 51;
+  --line-strong: 58 58 76;
+
+  /* Text is NOT pure white. #fff on #0b0b10 is harsh and causes halation on
+     OLED; 240/240/246 keeps the contrast ratio above 15:1 while staying soft. */
+  --ink: 240 240 246;
+  --muted: 162 162 182;
+  --faint: 112 112 134;
+
+  /* The brand violet is brightened. #7c3aed on a dark canvas looks almost
+     black at small sizes; #8b5cf6 keeps the hue and restores the punch. */
+  --brand: 139 92 246;
+  --brand-soft: 45 32 82;
+  --brand-ink: 255 255 255;
+
+  --accent: 45 212 191;
+  --accent-soft: 19 58 55;
+
+  --positive: 74 222 128;
+  --caution: 251 191 36;
+  --negative: 248 113 113;
+  --info: 56 189 248;
+
+  /* Shadows are nearly switched off. In dark mode they read as muddy smudges
+     rather than depth, so elevation is carried by surface lightness instead. */
+  --shadow: 0 0 0;
+}
+
+/* ==========================================================================
+   BASE
+   ========================================================================== */
+@layer base {
+  * {
+    border-color: rgb(var(--line));
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    margin: 0;
+    min-height: 100vh;
+    /* Tabular figures everywhere: this app displays a lot of numbers, and
+       proportional digits make columns of scores jitter as they change. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Respect the OS setting. Animations are decoration; motion sensitivity is
+     not. Anything that moves is reduced to a near-instant opacity change. */
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* A single, consistent focus ring. `:focus-visible` only, so mouse users do
+     not see rings on every click, but keyboard users always do. */
+  :focus-visible {
+    outline: 2px solid rgb(var(--brand));
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  ::selection {
+    background: rgb(var(--brand) / 0.24);
+  }
+
+  /* Headings inherit colour rather than setting their own, so a heading inside
+     a tinted card stays readable. */
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display font-semibold text-ink;
+    text-wrap: balance;
+  }
+
+  code, pre, kbd {
+    @apply font-mono;
+  }
+
+  /* Inputs inherit theme colours; the browser default is always wrong here. */
+  input, textarea, select, button {
+    font: inherit;
+    color: inherit;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(var(--faint));
+  }
+}
+
+/* ==========================================================================
+   SCROLLBARS
+   A themed scrollbar is a small thing that makes a big difference: the default
+   light scrollbar on a dark panel is the single most common giveaway that a
+   dark mode was an afterthought.
+   ========================================================================== */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line-strong)) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--line-strong));
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--faint));
+    background-clip: content-box;
+  }
+
+  /* Loading skeleton. A moving highlight reads as "working"; a static grey box
+     reads as "broken". */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-sunken;
+  }
+
+  .skeleton::after {
+    content: "";
+    @apply absolute inset-0 animate-shimmer;
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgb(var(--line) / 0.9) 50%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+  }
+
+  /* Faint dot grid used behind the landing hero and empty states. Kept very
+     low contrast so it never competes with content. */
+  .bg-dotgrid {
+    background-image: radial-gradient(
+      rgb(var(--line-strong) / 0.5) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+  }
+
+  /* A soft radial wash for hero sections. */
+  .bg-brand-wash {
+    background-image: radial-gradient(
+      60% 60% at 50% 0%,
+      rgb(var(--brand) / 0.13) 0%,
+      transparent 70%
+    );
+  }
+
+  .text-gradient-brand {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(
+      100deg,
+      rgb(var(--brand)) 0%,
+      rgb(var(--accent)) 100%
+    );
+  }
+}
+
+/* ==========================================================================
+   MARKDOWN ANSWER BODY
+   The generated answer is Markdown, and it is the most-read text in the app.
+   Tailwind Typography is not a dependency, so the rules are written out here
+   against the same tokens - which means answers are themed for free.
+   ========================================================================== */
+@layer components {
+  /*
+    Answer typography.
+
+    Previously the body was 15px on a 28px line while every surrounding control was
+    11px. That gap made the answer look inflated next to its own chrome, and the
+    generous paragraph margins pushed a short answer into a tall column. Scaled to
+    14px on a tighter line with reduced block spacing, so the answer reads as part
+    of the same design rather than a document pasted into it.
+  */
+  .answer-body {
+    @apply text-sm leading-[1.7] text-ink;
+  }
+
+  .answer-body > *:first-child {
+    margin-top: 0;
+  }
+
+  .answer-body > *:last-child {
+    margin-bottom: 0;
+  }
+
+  .answer-body p {
+    @apply my-2.5;
+  }
+
+  /* Headings step down gently instead of jumping: the largest is only two notches
+     above the body, so an answer with headings still reads as one block of prose. */
+  .answer-body h1,
+  .answer-body h2,
+  .answer-body h3,
+  .answer-body h4 {
+    @apply mb-1.5 mt-4 font-semibold leading-snug text-ink;
+  }
+
+  .answer-body h1 { @apply text-base; }
+  .answer-body h2 { @apply text-[0.9375rem]; }
+  .answer-body h3 { @apply text-sm; }
+  .answer-body h4 { @apply text-[0.8125rem] uppercase tracking-wide text-muted; }
+
+  .answer-body ul,
+  .answer-body ol {
+    @apply my-2.5 space-y-1 pl-5;
+  }
+
+  .answer-body ul { @apply list-disc; }
+  .answer-body ol { @apply list-decimal; }
+
+  .answer-body li::marker {
+    color: rgb(var(--brand));
+  }
+
+  .answer-body li > ul,
+  .answer-body li > ol {
+    @apply my-1;
+  }
+
+  .answer-body strong {
+    @apply font-semibold text-ink;
+  }
+
+  .answer-body em {
+    @apply italic;
+  }
+
+  .answer-body a {
+    @apply font-medium text-brand underline decoration-brand/30 underline-offset-2;
+  }
+
+  .answer-body a:hover {
+    @apply decoration-brand;
+  }
+
+  .answer-body code {
+    @apply rounded border border-line bg-sunken px-1 py-0.5 text-[0.8125rem] text-ink;
+  }
+
+  .answer-body pre {
+    @apply my-2.5 overflow-x-auto rounded-lg border border-line bg-sunken p-3 text-[0.8125rem] leading-6;
+  }
+
+  /* Inside a block, inline-code styling must be undone or the padding stacks. */
+  .answer-body pre code {
+    @apply border-0 bg-transparent p-0 text-inherit;
+  }
+
+  .answer-body blockquote {
+    @apply my-2.5 border-l-2 border-brand/40 pl-3.5 text-muted;
+  }
+
+  .answer-body table {
+    @apply my-2.5 w-full border-collapse overflow-hidden text-[0.8125rem];
+  }
+
+  .answer-body th {
+    @apply border border-line bg-sunken px-2.5 py-1.5 text-left font-semibold text-ink;
+  }
+
+  .answer-body td {
+    @apply border border-line px-2.5 py-1.5 align-top;
+  }
+
+  .answer-body hr {
+    @apply my-4 border-t border-line;
+  }
+
+  .answer-body img {
+    @apply my-2.5 max-w-full rounded-lg border border-line;
+  }
+}

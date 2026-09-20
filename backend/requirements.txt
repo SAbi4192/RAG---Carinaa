@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Carinaa — backend requirements
+#
+# Install:
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install -r backend/requirements.txt
+#   .venv\Scripts\python -m pip install llama-cpp-python --extra-index-url ^
+#       https://abetlen.github.io/llama-cpp-python/whl/cpu
+# ---------------------------------------------------------------------------
+
+# --- Web framework -----------------------------------------------------------
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+websockets>=13.0
+
+# --- Config & validation -----------------------------------------------------
+pydantic>=2.9
+pydantic-settings>=2.6
+email-validator>=2.2
+python-dotenv>=1.0
+
+# --- Database ----------------------------------------------------------------
+SQLAlchemy>=2.0.36
+
+# --- Auth & security ---------------------------------------------------------
+bcrypt>=4.2
+PyJWT>=2.10
+
+# --- HTTP client (Gemini / Groq) ---------------------------------------------
+httpx>=0.27
+
+# --- Document parsing --------------------------------------------------------
+pypdf>=5.1
+python-docx>=1.1
+python-pptx>=1.0
+openpyxl>=3.1
+
+# --- Embeddings (ONNX, no PyTorch required) ----------------------------------
+fastembed>=0.4
+numpy>=1.26
+
+# --- Vector store ------------------------------------------------------------
+# Primary: ChromaDB (persistent, embedded, metadata filtering).
+chromadb>=0.5.20
+
+# --- Local LLM (offline mode) ------------------------------------------------
+# NOTE: install separately from the prebuilt CPU wheel index, see header.
+llama-cpp-python>=0.3.2
+
+# --- Tests -------------------------------------------------------------------
+pytest>=8.3
+pytest-asyncio>=0.24
