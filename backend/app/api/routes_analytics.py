@@ -25,6 +25,19 @@ def _require_workspace(db: DbSession, user: CurrentUser, workspace_id: int) -> W
     return workspace
 
 
+def percentile(values: list[int], fraction: float) -> float:
+    """Nearest-rank percentile over an ALREADY SORTED list.
+
+    Deliberately naive (no interpolation): with the sample sizes this analytics page
+    sees, an interpolated p95 would imply a precision the data does not have. Callers
+    sort once and ask for both p50 and p95 from the same list.
+    """
+    if not values:
+        return 0.0
+    index = min(len(values) - 1, max(0, int(len(values) * fraction) - 1))
+    return float(values[index])
+
+
 @router.get("/overview")
 def overview(
     user: CurrentUser,
@@ -47,6 +60,8 @@ def overview(
             "chunks": 0,
             "conversations": 0,
             "queries": 0,
+            "web_searches": 0,
+            "avg_total_ms": 0,
             "grounding": {status: 0 for status in STATUS_LABELS},
             "note": "No workspaces yet. Create one and upload a document to see analytics.",
         }
@@ -88,12 +103,45 @@ def overview(
         ).all()
     )
 
+    # WHY the web-search count is read from `messages` and not from `query_logs`:
+    # QueryLog has no web_search_used column, and the flag has to be a real one -
+    # so it is counted from the assistant Message rows, which already record it.
+    # The join chain is the ownership path: messages -> conversations -> workspaces.
+    web_searches = int(
+        db.scalar(
+            select(func.count())
+            .select_from(Message)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(
+                Conversation.workspace_id.in_(workspace_ids),
+                Message.role == "assistant",
+                Message.web_search_used.is_(True),
+            )
+        )
+        or 0
+    )
+
+    avg_total_ms = int(
+        round(
+            float(
+                db.scalar(
+                    select(func.avg(QueryLog.total_ms)).where(
+                        QueryLog.workspace_id.in_(workspace_ids)
+                    )
+                )
+                or 0.0
+            )
+        )
+    )
+
     return {
         "workspaces": len(workspace_ids),
         "documents": documents,
         "chunks": chunks,
         "conversations": conversations,
         "queries": queries,
+        "web_searches": web_searches,
+        "avg_total_ms": avg_total_ms,
         "grounding": {status: int(grounding_rows.get(status, 0)) for status in STATUS_LABELS},
         "grounding_labels": STATUS_LABELS,
     }
@@ -158,18 +206,50 @@ def retrieval_metrics(
     latencies = sorted(row["total_ms"] for row in rows if row["total_ms"])
     retrieval_latencies = sorted(row["retrieval_ms"] for row in rows if row["retrieval_ms"])
 
-    def percentile(values: list[int], fraction: float) -> float:
-        if not values:
-            return 0.0
-        index = min(len(values) - 1, max(0, int(len(values) * fraction) - 1))
-        return float(values[index])
-
     provider_counts: dict[str, int] = {}
     mode_counts: dict[str, int] = {}
     for row in rows:
         key = row["provider"] or "unknown"
         provider_counts[key] = provider_counts.get(key, 0) + 1
         mode_counts[row["ai_mode"]] = mode_counts.get(row["ai_mode"], 0) + 1
+
+    # Which documents actually backed these answers, counted from the stored
+    # citations rather than from uploads: a file that never contributed to an
+    # answer must not show up here as "used". Web citations are excluded -
+    # "document usage" means your knowledge, not the internet.
+    #
+    # The web-search flag lives on Message, not QueryLog (adding a column would
+    # be a schema change), so it is read from the same rows already loaded.
+    document_stats: dict[str, dict[str, int]] = {}
+    web_searches = 0
+    for message in messages.values():
+        if message.web_search_used:
+            web_searches += 1
+        cited_names = {
+            str(citation.get("document_name") or "")
+            for citation in (message.citations or [])
+            if isinstance(citation, dict)
+            and citation.get("kind", "document") == "document"
+            and citation.get("document_name")
+        }
+        for name in cited_names:
+            stats = document_stats.setdefault(name, {"citations": 0, "queries": 0})
+            stats["citations"] += sum(
+                1
+                for citation in (message.citations or [])
+                if isinstance(citation, dict)
+                and citation.get("kind", "document") == "document"
+                and str(citation.get("document_name") or "") == name
+            )
+            stats["queries"] += 1
+
+    top_documents = sorted(
+        (
+            {"name": name, "citations": stats["citations"], "queries": stats["queries"]}
+            for name, stats in document_stats.items()
+        ),
+        key=lambda item: (-item["citations"], -item["queries"], item["name"]),
+    )[:10]
 
     return {
         **metrics,
@@ -182,6 +262,8 @@ def retrieval_metrics(
         },
         "providers": provider_counts,
         "modes": mode_counts,
+        "documents": top_documents,
+        "web_searches": web_searches,
         "recent": [
             {
                 "provider": row["provider"],
@@ -232,7 +314,23 @@ def activity(
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
     logs = list(db.scalars(statement.where(QueryLog.created_at >= since)).all())
 
+    # One extra query resolves the web-search flag for this window: QueryLog carries no
+    # web_search_used column, so it is read back from the assistant Message each log
+    # points at. An id that is absent (or null) counts as False rather than guessing.
+    log_message_ids = [log.message_id for log in logs if log.message_id]
+    web_message_ids = set(
+        db.scalars(
+            select(Message.id).where(
+                Message.id.in_(log_message_ids or [0]),
+                Message.role == "assistant",
+                Message.web_search_used.is_(True),
+            )
+        ).all()
+    )
+
     buckets: dict[str, dict[str, int]] = {}
+    day_total_ms: dict[str, int] = {}
+    day_web_searches: dict[str, int] = {}
     today = dt.datetime.now(dt.timezone.utc).date()
     for offset in range(days - 1, -1, -1):
         day = (today - dt.timedelta(days=offset)).isoformat()
@@ -250,8 +348,147 @@ def activity(
             buckets[day]["refusals"] += 1
         if log.grounding_status == "CITATION_ERROR":
             buckets[day]["citation_errors"] += 1
+        day_total_ms[day] = day_total_ms.get(day, 0) + int(log.total_ms or 0)
+        if log.message_id in web_message_ids:
+            day_web_searches[day] = day_web_searches.get(day, 0) + 1
 
     return {
         "days": days,
-        "series": [{"date": day, **values} for day, values in sorted(buckets.items())],
+        "series": [
+            {
+                "date": day,
+                **values,
+                # A day with no queries averages to 0, not to an empty/None value the
+                # chart would have to special-case.
+                "avg_ms": int(round(day_total_ms.get(day, 0) / values["queries"]))
+                if values["queries"]
+                else 0,
+                "web_searches": day_web_searches.get(day, 0),
+            }
+            for day, values in sorted(buckets.items())
+        ],
     }
+
+
+@router.get("/stages")
+def stage_metrics(
+    user: CurrentUser,
+    db: DbSession,
+    workspace_id: int | None = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
+    limit: int = Query(default=2000, ge=1, le=20000),
+) -> dict:
+    """Per-stage timings aggregated from the trace events the pipeline recorded.
+
+    These are the durations RAG Trace already shows one query at a time, summed up.
+    Nothing here is derived from a vendor's reported latency - each event is a stage
+    the pipeline actually ran and timed with `perf_counter`.
+    """
+    import datetime as dt
+
+    from app.db.models import TraceEvent
+    from app.rag.trace import conditional_stage_definitions, stage_definitions
+
+    workspace_ids = (
+        [workspace_id]
+        if workspace_id is not None
+        else list(db.scalars(select(Workspace.id).where(Workspace.user_id == user.id)).all())
+    )
+    if workspace_id is not None:
+        _require_workspace(db, user, workspace_id)
+
+    if not workspace_ids:
+        return {
+            "total_queries": 0,
+            "stages": [],
+            "note": "No traces recorded yet. Ask a question in Chat and this fills in.",
+        }
+
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+    # Ownership path: trace_events -> messages -> conversations -> workspaces, the same
+    # chain the security report uses. Filtering on the workspace is what keeps one
+    # user's stage timings out of another user's response.
+    rows = db.execute(
+        select(
+            TraceEvent.stage,
+            TraceEvent.status,
+            TraceEvent.duration_ms,
+            TraceEvent.trace_id,
+        )
+        .join(Message, Message.id == TraceEvent.message_id)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.workspace_id.in_(workspace_ids),
+            TraceEvent.created_at >= since,
+        )
+        # `limit` bounds EVENTS, so newest-first keeps the most recent traces whole
+        # instead of truncating them at the cut-off.
+        .order_by(TraceEvent.id.desc())
+        .limit(limit)
+    ).all()
+
+    if not rows:
+        return {
+            "total_queries": 0,
+            "stages": [],
+            "note": "No traces recorded yet. Ask a question in Chat and this fills in.",
+        }
+
+    durations: dict[str, list[int]] = {}
+    skipped_counts: dict[str, int] = {}
+    error_counts: dict[str, int] = {}
+    trace_totals: dict[str, int] = {}
+
+    for row in rows:
+        duration = int(row.duration_ms or 0)
+        # Per-trace totals feed avg_total_ms. A skipped event carries 0 ms, so including
+        # it here changes nothing.
+        trace_totals[row.trace_id] = trace_totals.get(row.trace_id, 0) + duration
+        if row.status == "skipped":
+            # A skipped stage performed no work, so it must not drag the average down.
+            # It is still reported, in `skipped`, because hiding it is the failure this
+            # project exists to prevent.
+            skipped_counts[row.stage] = skipped_counts.get(row.stage, 0) + 1
+            continue
+        if row.status == "error":
+            error_counts[row.stage] = error_counts.get(row.stage, 0) + 1
+        durations.setdefault(row.stage, []).append(duration)
+
+    # Labels come from the trace module so the UI and the backend cannot drift apart.
+    present = set(durations) | set(skipped_counts) | set(error_counts)
+    ordered = [item["stage"] for item in stage_definitions()]
+    ordered += [
+        item["stage"] for item in conditional_stage_definitions() if item["stage"] in present
+    ]
+    # An unrecognised stage is still real data; dropping it would be worse than a
+    # title-cased fallback label.
+    ordered += sorted(stage for stage in present if stage not in ordered)
+    labels = {item["stage"]: item["label"] for item in stage_definitions()}
+    labels.update({item["stage"]: item["label"] for item in conditional_stage_definitions()})
+
+    stages: list[dict] = []
+    for stage in ordered:
+        values = sorted(durations.get(stage, []))
+        total = sum(values)
+        stages.append(
+            {
+                "stage": stage,
+                "label": labels.get(stage, stage.replace("_", " ").title()),
+                "count": len(values),
+                "avg_ms": round(total / len(values), 1) if values else 0.0,
+                "p50_ms": int(round(percentile(values, 0.5))),
+                "p95_ms": int(round(percentile(values, 0.95))),
+                "total_ms": int(total),
+                "skipped": int(skipped_counts.get(stage, 0)),
+                "errors": int(error_counts.get(stage, 0)),
+            }
+        )
+
+    trace_count = len(trace_totals)
+    return {
+        "total_queries": trace_count,
+        "avg_total_ms": int(round(sum(trace_totals.values()) / trace_count)) if trace_count else 0,
+        "stages": stages,
+        "note": "Measured from the trace events the pipeline recorded for each answer.",
+    }
+

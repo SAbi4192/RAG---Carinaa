@@ -20,8 +20,14 @@ import { cn } from "@/lib/cn";
  * ("That file is larger than the 25 MB limit."), and a partial success needs to
  * say what DID happen. A generic toast wrapper would only get in the way.
  *
- * Errors do not auto-dismiss. A message the user missed is worse than a message
- * they have to close.
+ * AUTO-DISMISS
+ * ------------
+ * Every toast clears itself after a few seconds, including errors. An error that
+ * camps on the screen until it is manually closed punishes the user for something
+ * that is already over; the same information is also visible where it matters
+ * (the chat error panel, the upload dialog). Manual dismissal is always
+ * available, and a caller can pass `durationMs: 0` for a genuinely critical
+ * notice that must stay until acknowledged.
  */
 
 export type ToastTone = "success" | "error" | "warning" | "info";
@@ -74,18 +80,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const id = nextId++;
       setToasts((current) => [...current.slice(-4), { id, tone, title, description }]);
 
-      // An explicit duration always wins - some notices are informational and
-      // should clear themselves, even though their tone would normally persist.
-      if (durationMs !== undefined) {
-        window.setTimeout(() => dismiss(id), durationMs);
-        return;
-      }
-
-      // Success and info are self-evidently transient. Errors and warnings are
-      // not: they usually require the user to change something.
-      if (tone === "success" || tone === "info") {
-        window.setTimeout(() => dismiss(id), 4500);
-      }
+      // durationMs === 0 means "critical: stay until dismissed". Everything else
+      // clears itself - the default is deliberately short, so ordinary status and
+      // error notices never occupy the screen until manually closed.
+      if (durationMs === 0) return;
+      window.setTimeout(() => dismiss(id), durationMs ?? 3500);
     },
     [dismiss],
   );

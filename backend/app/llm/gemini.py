@@ -1,5 +1,9 @@
 """
-Gemini provider (primary, online).
+Gemini provider (fallback, online).
+
+Groq is the primary online provider (see `app/llm/adapter.py`); Gemini answers
+when Groq is unavailable or not configured. The fallback is always disclosed to
+the user as "Gemini · Fallback" - never presented as the primary's work.
 
 API shape:  POST {base}/models/{model}:generateContent?key=API_KEY
 Docs:       https://ai.google.dev/gemini-api/docs/text-generation
@@ -14,7 +18,8 @@ key is configured, never its value.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -30,6 +35,7 @@ from app.llm.base import (
     Stopwatch,
     flatten_messages,
     is_truncated,
+    iter_sse_data,
 )
 
 logger = get_logger(__name__)
@@ -49,7 +55,7 @@ _SAFETY_SETTINGS = [
 class GeminiProvider:
     name = "gemini"
     label = "Gemini"
-    role = "primary"
+    role = "fallback"
 
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         self.api_key = (api_key if api_key is not None else settings.gemini_api_key).strip()
@@ -132,9 +138,15 @@ class GeminiProvider:
                 "Gemini rejected our credentials. Check that GEMINI_API_KEY is valid."
             )
         if response.status_code == 404:
+            # RETRYABLE. A 404 means THIS model id is not available to this key - it says
+            # nothing about the other models in the chain. Marking it non-retryable would
+            # stop the chain after the first entry, which defeats the point of having a
+            # chain: 2.5-flash being unavailable must not prevent trying 3.5-flash.
             raise LLMError(
                 f"Gemini does not recognise the model '{self.model}'. Pick a current model "
-                f"on the Settings page."
+                f"on the Settings page.",
+                retryable=True,
+                status_code=404,
             )
         if response.status_code >= 500:
             raise ProviderUnavailableError(f"Gemini returned HTTP {response.status_code}.")
@@ -190,6 +202,105 @@ class GeminiProvider:
             },
             finish_reason=finish_reason,
         )
+
+    # --------------------------------------------------------------- streaming
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield Gemini's real token deltas via `streamGenerateContent`.
+
+        Gemini streams with `?alt=sse`, which returns the same SSE framing Groq uses,
+        so the payload parsing differs only in where the text lives
+        (candidates[0].content.parts[].text instead of choices[0].delta.content).
+        """
+        if not self.configured:
+            raise ProviderConfigError("Gemini is not configured (GEMINI_API_KEY missing).")
+
+        system_text, user_text = flatten_messages(messages)
+        output_budget = max_tokens or settings.gemini_max_output_tokens
+        thinking_budget = settings.gemini_thinking_budget
+
+        generation_config: dict[str, Any] = {
+            "temperature": settings.gemini_temperature if temperature is None else temperature,
+            "maxOutputTokens": output_budget + max(0, thinking_budget),
+        }
+        if thinking_budget >= 0:
+            generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+            "generationConfig": generation_config,
+            "safetySettings": _SAFETY_SETTINGS,
+        }
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+        url = f"{self.base_url}/models/{self.model}:streamGenerateContent"
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST", url, params={"key": self.api_key, "alt": "sse"}, json=payload
+                ) as response:
+                    if response.status_code == 429:
+                        raise RateLimitedError("Gemini is rate limiting us.")
+                    if response.status_code in (401, 403):
+                        raise ProviderConfigError(
+                            "Gemini rejected our credentials. Check that GEMINI_API_KEY is valid."
+                        )
+                    if response.status_code == 404:
+                        raise LLMError(
+                            f"Gemini does not recognise the model '{self.model}'. Pick a current "
+                            f"model on the Settings page.",
+                            retryable=True,
+                            status_code=404,
+                        )
+                    if response.status_code >= 500:
+                        raise ProviderUnavailableError(
+                            f"Gemini returned HTTP {response.status_code}."
+                        )
+                    if response.status_code != 200:
+                        raise LLMError(f"Gemini returned HTTP {response.status_code}.")
+
+                    async for data in iter_sse_data(response.aiter_lines()):
+                        try:
+                            event = json.loads(data)
+                        except ValueError:
+                            continue
+                        text = self._extract_stream_text(event)
+                        if text:
+                            yield text
+        except httpx.TimeoutException as exc:
+            raise ProviderUnavailableError("Gemini timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                f"Could not reach Gemini ({exc.__class__.__name__})."
+            ) from exc
+
+    def _extract_stream_text(self, data: dict[str, Any]) -> str:
+        """Visible text from one streamed chunk, excluding reasoning parts.
+
+        Gemini can inline "thought" parts when thinking is enabled. Those are the
+        model's internal reasoning, not the answer, and must never reach the user -
+        so a part explicitly flagged `thought` is skipped. Parts without the flag
+        (the normal case when thinking is off) are included.
+        """
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return ""
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        chunks: list[str] = []
+        for part in parts:
+            if part.get("thought"):
+                continue
+            text = part.get("text")
+            if text:
+                chunks.append(str(text))
+        return "".join(chunks)
 
     def _extract_text(self, data: dict[str, Any]) -> tuple[str, str]:
         candidates = data.get("candidates") or []

@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="generator" content="architecture-diagram 1.0 (Cocoon AI lineage) + intent-trace">
+<title>Carinaa — RAG Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #020617;
+    min-height: 100vh;
+    padding: 2rem;
+    color: white;
+  }
+
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  .header { margin-bottom: 2rem; }
+  .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+
+  .pulse-dot {
+    width: 12px; height: 12px; background: #22d3ee; border-radius: 50%;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+
+  .subtitle { color: #94a3b8; font-size: 0.875rem; margin-left: 1.75rem; line-height: 1.6; }
+  .subtitle strong { color: #cbd5e1; font-weight: 600; }
+
+  .diagram-container {
+    background: rgba(15, 23, 42, 0.5);
+    border-radius: 1rem;
+    border: 1px solid #1e293b;
+    padding: 1.5rem;
+    overflow-x: auto;
+  }
+
+  svg { width: 100%; min-width: 940px; display: block; }
+
+  /* ======================================================================
+     HOVER / INTENT TRACE
+     Hovering a component dims everything that is not part of its immediate
+     neighbourhood, glows the component itself, and animates a directional
+     flow along every edge that touches it. Same behaviour as the factory
+     diagram: the page stays static until you point at something.
+     ====================================================================== */
+
+  svg [data-node-id],
+  svg [data-edge-from] {
+    transition: opacity 0.22s ease, filter 0.22s ease;
+  }
+
+  /* Edges never capture the pointer - only components are hover targets. */
+  svg [data-edge-from] { pointer-events: none; }
+
+  /* While a trace is active, quiet everything... */
+  svg[data-intent-trace-active] [data-node-id],
+  svg[data-intent-trace-active] [data-edge-from] { opacity: 0.16; }
+
+  /* ...then bring back the hovered component and its direct neighbours. */
+  svg[data-intent-trace-active] [data-intent-trace-match] { opacity: 1; }
+
+  svg[data-intent-trace-active] [data-intent-trace-selected] {
+    filter: drop-shadow(0 0 10px #22d3ee);
+  }
+
+  .intent-trace-flow {
+    fill: none;
+    stroke: #22d3ee;
+    stroke-width: 2.6;
+    stroke-linecap: round;
+    stroke-dasharray: 7 12;
+    filter: drop-shadow(0 0 5px rgba(34, 211, 238, 0.85));
+    pointer-events: none;
+    animation: trace-flow 0.9s linear infinite;
+  }
+  .intent-trace-flow[data-direction="reverse"] { animation-direction: reverse; }
+
+  @keyframes trace-flow { to { stroke-dashoffset: -19; } }
+
+  /* The caption under the diagram mirrors the highlight. */
+  .trace-caption {
+    margin-top: 0.875rem;
+    min-height: 1.25rem;
+    font-size: 0.75rem;
+    color: #64748b;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .trace-caption b { color: #e2e8f0; font-weight: 600; }
+  .trace-caption .swatch {
+    width: 8px; height: 8px; border-radius: 50%; background: #22d3ee; flex-shrink: 0;
+  }
+  .trace-caption .hint { color: #475569; }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+
+  .card {
+    background: rgba(15, 23, 42, 0.5);
+    border-radius: 0.75rem;
+    border: 1px solid #1e293b;
+    padding: 1.25rem;
+    transition: border-color 0.2s ease, transform 0.2s ease;
+  }
+  .card:hover {
+    border-color: #334155;
+    transform: translateY(-2px);
+  }
+
+  .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .card-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .card-dot.cyan { background: #22d3ee; }
+  .card-dot.emerald { background: #34d399; }
+  .card-dot.violet { background: #a78bfa; }
+  .card-dot.amber { background: #fbbf24; }
+  .card-dot.rose { background: #fb7185; }
+
+  .card h3 { font-size: 0.875rem; font-weight: 600; }
+  .card ul { list-style: none; color: #94a3b8; font-size: 0.75rem; line-height: 1.65; }
+  .card li { margin-bottom: 0.375rem; }
+  .card li b { color: #e2e8f0; font-weight: 600; }
+
+  .footer { text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .pulse-dot { animation: none; }
+    .intent-trace-flow { animation: none; }
+    svg [data-node-id], svg [data-edge-from] { transition: none; }
+    .card:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-row">
+      <div class="pulse-dot"></div>
+      <h1>Carinaa — RAG Architecture</h1>
+    </div>
+    <p class="subtitle">
+      <strong>Every answer, traceable.</strong>
+      Two pipelines that share exactly one thing — the vector store.
+      Ingestion runs once per document; query runs once per question.
+      <strong>Point at any component</strong> to isolate it and watch the data flow along its connections.
+    </p>
+  </div>
+
+  <!-- Main Diagram -->
+  <div class="diagram-container">
+    <svg id="arch" viewBox="0 0 1000 1020" role="img"
+         aria-label="Carinaa RAG system architecture. Hover a component to highlight its connections.">
+      <defs>
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+        </marker>
+        <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+        </pattern>
+      </defs>
+
+      <rect width="100%" height="100%" fill="url(#grid)" />
+
+      <!-- ================================================================
+           LAYER 1 - region frames and their labels
+           ================================================================ -->
+      <rect x="40" y="24" width="920" height="104" rx="12"
+            fill="rgba(8, 51, 68, 0.18)" stroke="#22d3ee" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="52" y="42" fill="#22d3ee" font-size="10" font-weight="600">CLIENT — BROWSER</text>
+
+      <rect x="40" y="300" width="290" height="426" rx="12"
+            fill="rgba(120, 53, 15, 0.12)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="52" y="320" fill="#fbbf24" font-size="10" font-weight="600">INGESTION — per document</text>
+
+      <rect x="360" y="300" width="376" height="426" rx="12"
+            fill="rgba(6, 78, 59, 0.14)" stroke="#34d399" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="372" y="320" fill="#34d399" font-size="10" font-weight="600">QUERY — per question</text>
+
+      <rect x="764" y="300" width="196" height="426" rx="12"
+            fill="rgba(76, 29, 149, 0.16)" stroke="#a78bfa" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="776" y="320" fill="#a78bfa" font-size="10" font-weight="600">TRACE &amp; LEARNING</text>
+
+      <rect x="40" y="756" width="460" height="150" rx="12"
+            fill="rgba(76, 29, 149, 0.14)" stroke="#a78bfa" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="52" y="774" fill="#a78bfa" font-size="10" font-weight="600">STORAGE</text>
+
+      <rect x="520" y="756" width="440" height="150" rx="12"
+            fill="rgba(120, 53, 15, 0.12)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+      <text x="532" y="774" fill="#fbbf24" font-size="10" font-weight="600">MODEL PROVIDERS</text>
+
+      <!-- ================================================================
+           LAYER 2 - edges (drawn before the components, so they sit behind)
+           ================================================================ -->
+
+      <!-- client -> api -->
+      <line data-edge-from="client" data-edge-to="api" x1="203" y1="116" x2="203" y2="164"
+            stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <text x="215" y="142" fill="#94a3b8" font-size="9">HTTPS · JWT</text>
+
+      <line data-edge-from="lab" data-edge-to="api" x1="499" y1="116" x2="499" y2="164"
+            stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <line data-edge-from="device" data-edge-to="api" x1="700" y1="116" x2="700" y2="164"
+            stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <text x="688" y="142" fill="#94a3b8" font-size="9" text-anchor="end">speech text</text>
+
+      <!-- api -> pipelines -->
+      <line data-edge-from="api" data-edge-to="ing-parse" x1="255" y1="252" x2="255" y2="338"
+            stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <text x="267" y="276" fill="#94a3b8" font-size="9">document upload</text>
+
+      <line data-edge-from="api" data-edge-to="q-analysis" x1="546" y1="252" x2="546" y2="336"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <text x="558" y="276" fill="#94a3b8" font-size="9">question</text>
+
+      <!-- ingestion chain -->
+      <line data-edge-from="ing-parse" data-edge-to="ing-normalise" x1="185" y1="400" x2="185" y2="420"
+            stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="ing-normalise" data-edge-to="ing-chunk" x1="185" y1="480" x2="185" y2="500"
+            stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="ing-chunk" data-edge-to="ing-embed" x1="185" y1="560" x2="185" y2="580"
+            stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="ing-embed" data-edge-to="ing-store" x1="185" y1="640" x2="185" y2="660"
+            stroke="#fbbf24" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- ingestion -> storage -->
+      <line data-edge-from="ing-store" data-edge-to="store-sqlite" x1="140" y1="720" x2="140" y2="788"
+            stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="ing-store" data-edge-to="store-chroma" x1="320" y1="720" x2="320" y2="788"
+            stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- query chain -->
+      <line data-edge-from="q-analysis" data-edge-to="q-embedding" x1="548" y1="367" x2="548" y2="375"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-embedding" data-edge-to="q-search" x1="548" y1="405" x2="548" y2="413"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-search" data-edge-to="q-candidate" x1="548" y1="443" x2="548" y2="451"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-candidate" data-edge-to="q-rerank" x1="548" y1="481" x2="548" y2="489"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-rerank" data-edge-to="q-context" x1="548" y1="519" x2="548" y2="527"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-context" data-edge-to="q-generate" x1="548" y1="557" x2="548" y2="565"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-generate" data-edge-to="q-citation" x1="548" y1="595" x2="548" y2="603"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-citation" data-edge-to="q-grounding" x1="548" y1="633" x2="548" y2="641"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+      <line data-edge-from="q-grounding" data-edge-to="q-answer" x1="548" y1="671" x2="548" y2="679"
+            stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- query -> storage (routed down the channel between the two lanes) -->
+      <path data-edge-from="q-search" data-edge-to="store-chroma"
+            d="M 376 429 L 348 429 L 348 745 L 378 745 L 378 788"
+            fill="none" stroke="#a78bfa" stroke-width="1.4" stroke-dasharray="4,3"
+            marker-end="url(#arrowhead)"/>
+      <path data-edge-from="q-candidate" data-edge-to="store-sqlite"
+            d="M 376 467 L 338 467 L 338 738 L 156 738 L 156 788"
+            fill="none" stroke="#a78bfa" stroke-width="1.4" stroke-dasharray="4,3"
+            marker-end="url(#arrowhead)"/>
+
+      <!-- query -> providers (one trunk, three branches) -->
+      <path data-edge-from="q-generate" data-edge-to="prov-gemini"
+            d="M 720 581 L 744 581 L 744 750 L 650 750 L 650 788"
+            fill="none" stroke="#fbbf24" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+      <path data-edge-from="q-generate" data-edge-to="prov-groq"
+            d="M 720 581 L 744 581 L 744 750 L 737 750 L 737 788"
+            fill="none" stroke="#fbbf24" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+      <path data-edge-from="q-generate" data-edge-to="prov-local"
+            d="M 720 581 L 744 581 L 744 750 L 875 750 L 875 788"
+            fill="none" stroke="#fbbf24" stroke-width="1.4" marker-end="url(#arrowhead)"/>
+
+      <!-- query -> trace -->
+      <line data-edge-from="q-answer" data-edge-to="obs-trace" x1="720" y1="695" x2="774" y2="695"
+            stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+      <!-- trace column: related capabilities, stacked -->
+      <line data-edge-from="obs-trace" data-edge-to="obs-tracepage" x1="862" y1="660" x2="862" y2="644"
+            stroke="#a78bfa" stroke-width="1.2"/>
+      <line data-edge-from="obs-tracepage" data-edge-to="obs-learning" x1="862" y1="596" x2="862" y2="580"
+            stroke="#a78bfa" stroke-width="1.2"/>
+      <line data-edge-from="obs-learning" data-edge-to="obs-variants" x1="862" y1="532" x2="862" y2="516"
+            stroke="#a78bfa" stroke-width="1.2"/>
+      <line data-edge-from="obs-variants" data-edge-to="obs-analytics" x1="862" y1="468" x2="862" y2="452"
+            stroke="#a78bfa" stroke-width="1.2"/>
+      <line data-edge-from="obs-analytics" data-edge-to="obs-eval" x1="862" y1="404" x2="862" y2="388"
+            stroke="#a78bfa" stroke-width="1.2"/>
+
+      <!-- ================================================================
+           LAYER 3 - components
+           ================================================================ -->
+
+      <!-- ---- client ---- -->
+      <g data-node-id="client" data-node-label="Carinaa Web App">
+        <rect x="60" y="52" width="286" height="64" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="203" y="74" fill="white" font-size="11" font-weight="600" text-anchor="middle">Carinaa Web App</text>
+        <text x="203" y="89" fill="#94a3b8" font-size="9" text-anchor="middle">React 18 · TypeScript · Vite</text>
+        <text x="203" y="103" fill="#22d3ee" font-size="8" text-anchor="middle">Chat Mode · Learning Mode</text>
+      </g>
+
+      <g data-node-id="lab" data-node-label="RAG Laboratory">
+        <rect x="364" y="52" width="270" height="64" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="499" y="74" fill="white" font-size="11" font-weight="600" text-anchor="middle">RAG Laboratory</text>
+        <text x="499" y="89" fill="#94a3b8" font-size="9" text-anchor="middle">/app/playground · 10 benches</text>
+        <text x="499" y="103" fill="#22d3ee" font-size="8" text-anchor="middle">same code as production</text>
+      </g>
+
+      <g data-node-id="device" data-node-label="Device-local features">
+        <rect x="652" y="52" width="288" height="64" rx="6"
+              fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="796" y="74" fill="white" font-size="11" font-weight="600" text-anchor="middle">Device-local features</text>
+        <text x="796" y="89" fill="#94a3b8" font-size="9" text-anchor="middle">Read Aloud — SpeechSynthesis API</text>
+        <text x="796" y="103" fill="#22d3ee" font-size="8" text-anchor="middle">no text sent to a speech service</text>
+      </g>
+
+      <!-- ---- api ---- -->
+      <g data-node-id="api" data-node-label="FastAPI :8000">
+        <rect x="190" y="168" width="520" height="84" rx="8"
+              fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="450" y="190" fill="white" font-size="12" font-weight="700" text-anchor="middle">FastAPI  :8000</text>
+        <text x="450" y="206" fill="#94a3b8" font-size="9" text-anchor="middle">app/api/routes_*.py · also serves the built SPA</text>
+        <text x="450" y="221" fill="#6ee7b7" font-size="8" text-anchor="middle">/chat/ask · /chat/retrieve · /messages/{id}/trace · /features/*</text>
+        <text x="450" y="235" fill="#6ee7b7" font-size="8" text-anchor="middle">/documents · /labs · /analytics · /evaluation</text>
+      </g>
+
+      <g data-node-id="auth" data-node-label="Auth &amp; Isolation">
+        <rect x="736" y="168" width="224" height="84" rx="8"
+              fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="848" y="190" fill="white" font-size="11" font-weight="600" text-anchor="middle">Auth &amp; Isolation</text>
+        <text x="848" y="206" fill="#94a3b8" font-size="8.5" text-anchor="middle">JWT · bcrypt · core/security.py</text>
+        <text x="848" y="220" fill="#fda4af" font-size="8" text-anchor="middle">workspace_id is a pre-search filter,</text>
+        <text x="848" y="232" fill="#fda4af" font-size="8" text-anchor="middle">not a prompt-level hint</text>
+      </g>
+
+      <!-- ---- ingestion ---- -->
+      <g data-node-id="ing-parse" data-node-label="Parse &amp; validate">
+        <rect x="56" y="344" width="258" height="56" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="68" y="366" fill="white" font-size="10" font-weight="600">1 · Parse &amp; validate</text>
+        <text x="68" y="382" fill="#94a3b8" font-size="8">8 formats, one parser each</text>
+      </g>
+
+      <g data-node-id="ing-normalise" data-node-label="Normalise">
+        <rect x="56" y="424" width="258" height="56" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="68" y="446" fill="white" font-size="10" font-weight="600">2 · Normalise</text>
+        <text x="68" y="462" fill="#94a3b8" font-size="8">8 shapes → one internal type</text>
+      </g>
+
+      <g data-node-id="ing-chunk" data-node-label="Chunk">
+        <rect x="56" y="504" width="258" height="56" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="68" y="526" fill="white" font-size="10" font-weight="600">3 · Chunk</text>
+        <text x="68" y="542" fill="#94a3b8" font-size="8">structure-aware, whole-block overlap</text>
+      </g>
+
+      <g data-node-id="ing-embed" data-node-label="Embed">
+        <rect x="56" y="584" width="258" height="56" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="68" y="606" fill="white" font-size="10" font-weight="600">4 · Embed</text>
+        <text x="68" y="622" fill="#94a3b8" font-size="8">fastembed ONNX · local · 384-dim</text>
+      </g>
+
+      <g data-node-id="ing-store" data-node-label="Store">
+        <rect x="56" y="664" width="258" height="56" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="68" y="686" fill="white" font-size="10" font-weight="600">5 · Store</text>
+        <text x="68" y="702" fill="#94a3b8" font-size="8">vectors → Chroma · rows → SQLite</text>
+      </g>
+
+      <!-- ---- query ---- -->
+      <g data-node-id="q-analysis" data-node-label="Query analysis">
+        <rect x="376" y="340" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="352" fill="#d1fae5" font-size="9.5" font-weight="600">1 · Query analysis</text>
+        <text x="388" y="363" fill="#94a3b8" font-size="7.5">normalise · keywords · follow-up rewrite</text>
+      </g>
+
+      <g data-node-id="q-embedding" data-node-label="Query embedding">
+        <rect x="376" y="378" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="390" fill="#d1fae5" font-size="9.5" font-weight="600">2 · Query embedding</text>
+        <text x="388" y="401" fill="#94a3b8" font-size="7.5">the same model that embedded the chunks</text>
+      </g>
+
+      <g data-node-id="q-search" data-node-label="Vector search">
+        <rect x="376" y="416" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="428" fill="#d1fae5" font-size="9.5" font-weight="600">3 · Vector search</text>
+        <text x="388" y="439" fill="#94a3b8" font-size="7.5">cosine · hard-scoped to one workspace</text>
+      </g>
+
+      <g data-node-id="q-candidate" data-node-label="Candidate retrieval">
+        <rect x="376" y="454" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="466" fill="#d1fae5" font-size="9.5" font-weight="600">4 · Candidate retrieval</text>
+        <text x="388" y="477" fill="#94a3b8" font-size="7.5">join · dedupe · threshold · lexical blend</text>
+      </g>
+
+      <g data-node-id="q-rerank" data-node-label="Re-ranking (optional)">
+        <rect x="376" y="492" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="504" fill="#d1fae5" font-size="9.5" font-weight="600">5 · Re-ranking</text>
+        <text x="388" y="515" fill="#fbbf24" font-size="7.5">optional — reports “skipped” when it did not run</text>
+      </g>
+
+      <g data-node-id="q-context" data-node-label="Context building">
+        <rect x="376" y="530" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="542" fill="#d1fae5" font-size="9.5" font-weight="600">6 · Context building</text>
+        <text x="388" y="553" fill="#94a3b8" font-size="7.5">number [1][2][3] · character budget</text>
+      </g>
+
+      <g data-node-id="q-generate" data-node-label="LLM generation">
+        <rect x="376" y="568" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="580" fill="#d1fae5" font-size="9.5" font-weight="600">7 · LLM generation</text>
+        <text x="388" y="591" fill="#94a3b8" font-size="7.5">adapter routes to a provider (see below)</text>
+      </g>
+
+      <g data-node-id="q-citation" data-node-label="Citation resolution">
+        <rect x="376" y="606" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="618" fill="#d1fae5" font-size="9.5" font-weight="600">8 · Citation resolution</text>
+        <text x="388" y="629" fill="#94a3b8" font-size="7.5">every [n] mapped to a real passage</text>
+      </g>
+
+      <g data-node-id="q-grounding" data-node-label="Grounding">
+        <rect x="376" y="644" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="656" fill="#d1fae5" font-size="9.5" font-weight="600">9 · Grounding</text>
+        <text x="388" y="667" fill="#94a3b8" font-size="7.5">is the answer actually supported by the evidence?</text>
+      </g>
+
+      <g data-node-id="q-answer" data-node-label="Answer + RAG trace">
+        <rect x="376" y="682" width="344" height="26" rx="5" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="388" y="694" fill="#d1fae5" font-size="9.5" font-weight="600">10 · Answer + RAG trace</text>
+        <text x="388" y="705" fill="#94a3b8" font-size="7.5">canonical answer stored once · one trace row per stage</text>
+      </g>
+
+      <!-- ---- trace and learning ---- -->
+      <g data-node-id="obs-eval" data-node-label="Evaluation">
+        <rect x="776" y="340" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="362" fill="white" font-size="9" font-weight="600">Evaluation</text>
+        <text x="786" y="376" fill="#94a3b8" font-size="7.5">security self-tests · metrics</text>
+      </g>
+
+      <g data-node-id="obs-analytics" data-node-label="Analytics">
+        <rect x="776" y="404" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="426" fill="white" font-size="9" font-weight="600">Analytics</text>
+        <text x="786" y="440" fill="#94a3b8" font-size="7.5">retrieval + latency, measured</text>
+      </g>
+
+      <g data-node-id="obs-variants" data-node-label="Answer variants">
+        <rect x="776" y="468" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="490" fill="white" font-size="9" font-weight="600">Answer variants</text>
+        <text x="786" y="504" fill="#94a3b8" font-size="7.5">translate · shorten · explain</text>
+      </g>
+
+      <g data-node-id="obs-learning" data-node-label="Learning Mode">
+        <rect x="776" y="532" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="554" fill="white" font-size="9" font-weight="600">Learning Mode</text>
+        <text x="786" y="568" fill="#94a3b8" font-size="7.5">replays the selected answer</text>
+      </g>
+
+      <g data-node-id="obs-tracepage" data-node-label="RAG Trace page">
+        <rect x="776" y="596" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="618" fill="white" font-size="9" font-weight="600">RAG Trace page</text>
+        <text x="786" y="632" fill="#94a3b8" font-size="7.5">per message, survives reload</text>
+      </g>
+
+      <g data-node-id="obs-trace" data-node-label="TraceRecorder">
+        <rect x="776" y="660" width="172" height="48" rx="5" fill="rgba(76, 29, 149, 0.35)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="786" y="682" fill="white" font-size="9" font-weight="600">TraceRecorder</text>
+        <text x="786" y="696" fill="#94a3b8" font-size="7.5">one row per stage, real ms</text>
+      </g>
+
+      <!-- ---- storage ---- -->
+      <g data-node-id="store-sqlite" data-node-label="SQLite">
+        <rect x="56" y="790" width="200" height="100" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="156" y="809" fill="white" font-size="10" font-weight="600" text-anchor="middle">SQLite</text>
+        <text x="156" y="823" fill="#c4b5fd" font-size="7.5" text-anchor="middle">users · workspaces</text>
+        <text x="156" y="836" fill="#c4b5fd" font-size="7.5" text-anchor="middle">documents · chunks</text>
+        <text x="156" y="849" fill="#c4b5fd" font-size="7.5" text-anchor="middle">conversations · messages</text>
+        <text x="156" y="862" fill="#c4b5fd" font-size="7.5" text-anchor="middle">answer_variants</text>
+        <text x="156" y="875" fill="#c4b5fd" font-size="7.5" text-anchor="middle">trace_events · query_logs</text>
+      </g>
+
+      <g data-node-id="store-chroma" data-node-label="ChromaDB + uploads">
+        <rect x="272" y="790" width="212" height="100" rx="6"
+              fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="378" y="809" fill="white" font-size="10" font-weight="600" text-anchor="middle">ChromaDB + uploads</text>
+        <text x="378" y="825" fill="#c4b5fd" font-size="7.5" text-anchor="middle">one vector per chunk · 384-dim</text>
+        <text x="378" y="840" fill="#c4b5fd" font-size="7.5" text-anchor="middle">filtered by workspace_id before</text>
+        <text x="378" y="853" fill="#c4b5fd" font-size="7.5" text-anchor="middle">any comparison happens</text>
+        <text x="378" y="872" fill="#c4b5fd" font-size="7.5" text-anchor="middle">data/uploads — original files</text>
+      </g>
+
+      <!-- ---- providers ---- -->
+      <g data-node-id="prov-gemini" data-node-label="Gemini (primary)">
+        <rect x="536" y="790" width="126" height="64" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="599" y="811" fill="white" font-size="10" font-weight="600" text-anchor="middle">Gemini</text>
+        <text x="599" y="826" fill="#fbbf24" font-size="8" text-anchor="middle">primary</text>
+        <text x="599" y="840" fill="#94a3b8" font-size="7.5" text-anchor="middle">online mode</text>
+      </g>
+
+      <g data-node-id="prov-groq" data-node-label="Groq (fallback)">
+        <rect x="674" y="790" width="126" height="64" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="737" y="811" fill="white" font-size="10" font-weight="600" text-anchor="middle">Groq</text>
+        <text x="737" y="826" fill="#fbbf24" font-size="8" text-anchor="middle">fallback</text>
+        <text x="737" y="840" fill="#94a3b8" font-size="7.5" text-anchor="middle">online mode</text>
+      </g>
+
+      <g data-node-id="prov-local" data-node-label="llama.cpp (offline)">
+        <rect x="812" y="790" width="126" height="64" rx="6"
+              fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="875" y="811" fill="white" font-size="10" font-weight="600" text-anchor="middle">llama.cpp</text>
+        <text x="875" y="826" fill="#fbbf24" font-size="8" text-anchor="middle">local GGUF</text>
+        <text x="875" y="840" fill="#94a3b8" font-size="7.5" text-anchor="middle">offline mode</text>
+      </g>
+
+      <text x="740" y="874" fill="#fbbf24" font-size="8" text-anchor="middle">Routing is honest: a fallback answer is labelled, never shown as the primary.</text>
+      <text x="740" y="889" fill="#94a3b8" font-size="8" text-anchor="middle">Offline mode never reaches an online provider. Web search is opt-in, cited [W1].</text>
+
+      <!-- ================================================================
+           LEGEND
+           ================================================================ -->
+      <text x="52" y="950" fill="white" font-size="10" font-weight="600">Legend</text>
+
+      <rect x="52" y="962" width="16" height="10" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
+      <text x="74" y="971" fill="#94a3b8" font-size="8">Client / frontend</text>
+
+      <rect x="190" y="962" width="16" height="10" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+      <text x="212" y="971" fill="#94a3b8" font-size="8">Backend / query</text>
+
+      <rect x="336" y="962" width="16" height="10" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1"/>
+      <text x="358" y="971" fill="#94a3b8" font-size="8">Ingestion / providers</text>
+
+      <rect x="516" y="962" width="16" height="10" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
+      <text x="538" y="971" fill="#94a3b8" font-size="8">Storage / trace</text>
+
+      <rect x="656" y="962" width="16" height="10" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1"/>
+      <text x="678" y="971" fill="#94a3b8" font-size="8">Security</text>
+
+      <rect x="766" y="962" width="16" height="10" rx="2" fill="transparent" stroke="#64748b" stroke-width="1" stroke-dasharray="3,3"/>
+      <text x="788" y="971" fill="#94a3b8" font-size="8">Layer boundary</text>
+
+      <text x="52" y="996" fill="#64748b" font-size="8">Every value shown in the interface is measured at run time. A stage that did not run is labelled “skipped” — never given a plausible-looking duration.</text>
+    </svg>
+
+    <p class="trace-caption" id="trace-caption" aria-live="polite">
+      <span class="hint">Hover any component to trace its connections.</span>
+    </p>
+  </div>
+
+  <!-- Info Cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot cyan"></div>
+        <h3>Two pipelines, one shared store</h3>
+      </div>
+      <ul>
+        <li><b>Ingestion</b> runs once per document: parse → normalise → chunk → embed → store.</li>
+        <li><b>Query</b> runs once per question: analyse → embed → search → retrieve → context → generate → cite → ground.</li>
+        <li>They never call each other. The <b>only</b> thing they share is the vector store.</li>
+        <li>So a 300-page PDF is never re-parsed to answer a question, and a bad parse cannot slow down retrieval.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot emerald"></div>
+        <h3>Nothing is hidden behind a framework</h3>
+      </div>
+      <ul>
+        <li>Every stage writes a <b>TraceEvent</b> with its real duration and real counts.</li>
+        <li><b>Learning Mode</b> replays the pipeline of the <i>selected</i> answer — each message keeps its own trace.</li>
+        <li>A failed run keeps its trace too, so the interface can name <b>which stage failed</b>.</li>
+        <li>The RAG Laboratory runs the <b>same code</b> as production; it is not a simulation.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-dot rose"></div>
+        <h3>Honesty as an architectural constraint</h3>
+      </div>
+      <ul>
+        <li>Answers come only from retrieved evidence; otherwise the system <b>refuses</b> rather than guessing.</li>
+        <li>Conversation history is context, <b>never</b> document evidence — it can never be cited.</li>
+        <li>Re-ranking and web search report <b>“skipped”</b> when they did not run.</li>
+        <li>A Groq fallback is labelled a fallback; an extractive answer is labelled extractive.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <p class="footer">
+    Carinaa · Retrieval-Augmented Generation document intelligence ·
+    FastAPI + ChromaDB + SQLite + React ·
+    source: <code>backend/app/</code>
+  </p>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var svg = document.getElementById("arch");
+  if (!svg) return;
+
+  var caption = document.getElementById("trace-caption");
+  var nodes = Array.prototype.slice.call(svg.querySelectorAll("[data-node-id]"));
+  var edges = Array.prototype.slice.call(svg.querySelectorAll("[data-edge-from]"));
+  if (!nodes.length) return;
+
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  var pending = null;   // debounce timer
+  var activeId = null;  // the node currently traced
+
+  function nodeById(id) {
+    return svg.querySelector('[data-node-id="' + id + '"]');
+  }
+
+  function labelOf(id) {
+    var el = nodeById(id);
+    if (!el) return id;
+    return el.getAttribute("data-node-label") || id;
+  }
+
+  /* Every node and edge that touches `id`, plus the edge elements themselves. */
+  function neighbourhood(id) {
+    var ids = [id];
+    var seen = {};
+    seen[id] = true;
+    var touched = [];
+    var out = 0;
+    var incoming = 0;
+
+    edges.forEach(function (edge) {
+      var from = edge.getAttribute("data-edge-from");
+      var to = edge.getAttribute("data-edge-to");
+      if (from !== id && to !== id) return;
+      touched.push(edge);
+      if (from === id) out++;
+      if (to === id) incoming++;
+      [from, to].forEach(function (other) {
+        if (!seen[other]) { seen[other] = true; ids.push(other); }
+      });
+    });
+
+    return { ids: ids, edges: touched, out: out, incoming: incoming };
+  }
+
+  function clearTrace() {
+    svg.removeAttribute("data-intent-trace-active");
+    activeId = null;
+
+    nodes.forEach(function (node) {
+      node.removeAttribute("data-intent-trace-match");
+      node.removeAttribute("data-intent-trace-selected");
+    });
+    edges.forEach(function (edge) {
+      edge.removeAttribute("data-intent-trace-match");
+    });
+
+    var overlay = svg.querySelector("[data-intent-trace-overlay]");
+    if (overlay) overlay.remove();
+
+    if (caption) {
+      caption.innerHTML = '<span class="hint">Hover any component to trace its connections.</span>';
+    }
+  }
+
+  /* Re-draw each matched edge as an animated dashed path on top of the diagram,
+     so the flow direction is visible rather than implied. */
+  function drawFlow(id, touched) {
+    if (reduce) return;
+
+    var group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    group.setAttribute("class", "intent-trace-overlay");
+    group.setAttribute("data-intent-trace-overlay", "");
+    group.setAttribute("aria-hidden", "true");
+
+    touched.forEach(function (edge) {
+      var from = edge.getAttribute("data-edge-from");
+      var to = edge.getAttribute("data-edge-to");
+      var tag = edge.tagName.toLowerCase();
+      var d = "";
+
+      if (tag === "line") {
+        d = "M " + edge.getAttribute("x1") + " " + edge.getAttribute("y1") +
+            " L " + edge.getAttribute("x2") + " " + edge.getAttribute("y2");
+      } else if (tag === "path") {
+        d = edge.getAttribute("d") || "";
+      } else if (tag === "polyline") {
+        d = "M " + (edge.getAttribute("points") || "").trim().replace(/\s+/g, " L ");
+      }
+      if (!d) return;
+
+      var flow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      flow.setAttribute("d", d);
+      flow.setAttribute("class", "intent-trace-flow");
+      // If the hovered component is the target, the flow runs backwards along
+      // the edge - the data arrives at the thing you are pointing at.
+      flow.setAttribute("data-direction", to === id ? "reverse" : "forward");
+      group.appendChild(flow);
+    });
+
+    if (group.childNodes.length) svg.appendChild(group);
+  }
+
+  function activate(id) {
+    if (id === activeId) return;
+    clearTrace();
+
+    var hood = neighbourhood(id);
+    activeId = id;
+    svg.setAttribute("data-intent-trace-active", id);
+
+    hood.ids.forEach(function (other) {
+      var el = nodeById(other);
+      if (!el) return;
+      el.setAttribute("data-intent-trace-match", "");
+      if (other === id) el.setAttribute("data-intent-trace-selected", "");
+    });
+
+    hood.edges.forEach(function (edge) {
+      edge.setAttribute("data-intent-trace-match", "");
+    });
+
+    drawFlow(id, hood.edges);
+
+    if (caption) {
+      var parts = [];
+      if (hood.out) parts.push(hood.out + " out");
+      if (hood.incoming) parts.push(hood.incoming + " in");
+      if (!parts.length) parts.push("no links");
+      caption.innerHTML =
+        '<span class="swatch"></span><b>' + labelOf(id) + "</b>" +
+        '<span class="hint">· ' + parts.join(" · ") + " · " +
+        (hood.ids.length - 1) + " connected component" +
+        (hood.ids.length - 1 === 1 ? "" : "s") + "</span>";
+    }
+  }
+
+  function schedule(id) {
+    if (pending) window.clearTimeout(pending);
+    // 90 ms, matching the reference behaviour: a pointer sweeping across the
+    // diagram does not strobe through every component it passes over.
+    pending = window.setTimeout(function () {
+      pending = null;
+      if (activeId !== id) activate(id);
+    }, reduce ? 0 : 90);
+  }
+
+  function cancel() {
+    if (pending) { window.clearTimeout(pending); pending = null; }
+  }
+
+  function closestNode(target) {
+    if (!target || !target.closest) return null;
+    var el = target.closest("[data-node-id]");
+    return el && svg.contains(el) ? el : null;
+  }
+
+  // Listeners are attached unconditionally and the TOUCH check is done per event
+  // instead of behind a `(hover: hover)` media query. Gating the listeners on that
+  // query looks tidier but silently disables the whole interaction wherever the
+  // query reports false - headless browsers, some virtualised desktops, and hybrid
+  // laptops whose primary pointer is reported as coarse. A device that can hover
+  // gets the effect; a touch tap is ignored.
+  svg.addEventListener("pointerover", function (event) {
+    if (event.pointerType === "touch") return;
+    var node = closestNode(event.target);
+    if (!node) return;
+    if (event.relatedTarget && node.contains(event.relatedTarget)) return;
+    schedule(node.getAttribute("data-node-id"));
+  });
+
+  svg.addEventListener("pointerout", function (event) {
+    if (event.pointerType === "touch") return;
+    var node = closestNode(event.target);
+    if (!node) return;
+    if (event.relatedTarget && node.contains(event.relatedTarget)) return;
+    // Moving straight onto a neighbouring component: the next pointerover
+    // re-arms the trace, so do not tear it down here.
+    if (closestNode(event.relatedTarget)) return;
+    cancel();
+    clearTrace();
+  });
+
+  svg.addEventListener("pointerleave", function () {
+    cancel();
+    clearTrace();
+  });
+
+  // Keyboard parity: focus a component and the same trace runs.
+  nodes.forEach(function (node) {
+    node.setAttribute("tabindex", "0");
+  });
+  svg.addEventListener("focusin", function (event) {
+    var node = closestNode(event.target);
+    if (node) activate(node.getAttribute("data-node-id"));
+  });
+  svg.addEventListener("focusout", function (event) {
+    if (!closestNode(event.relatedTarget)) clearTrace();
+  });
+
+  // No resize handler on purpose. The overlay paths live in SVG user units, so the
+  // whole diagram - highlight included - rescales with the viewport and stays
+  // correct. Clearing on resize only meant the highlight vanished the moment the
+  // window changed size, which read as a glitch.
+})();
+</script>
+</body>
+</html>

@@ -1,16 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  GraduationCap,
   Loader2,
+  MessageSquareText,
   Pause,
   Play,
   RotateCcw,
+  Sparkles,
   Terminal,
   Workflow,
 } from "lucide-react";
 
 import { cn } from "@/lib/cn";
+import { api } from "@/lib/api";
+import { useAsync } from "@/hooks/useAsync";
 import { formatDuration } from "@/lib/format";
 import type { TraceStage } from "@/lib/types";
 import { useWorkspaces } from "@/state/workspace";
@@ -18,6 +25,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { EmptyState } from "@/components/ui/Feedback";
+import { GroundingBadge } from "@/components/chat/Citations";
 import { LiveTrace } from "@/components/rag/LiveTrace";
 import { stageExplanation } from "@/components/rag/stageExplanations";
 import { AskControls } from "./AskControls";
@@ -40,6 +48,24 @@ import { useAskRun } from "./useAskRun";
 export default function PipelineLab() {
   const { activeId } = useWorkspaces();
   const ask = useAskRun(activeId);
+
+  /* ---- experiment setup -------------------------------------------------
+     Everything the run is allowed to do, chosen up front: which knowledge to
+     search, and whether to add the web (opt-in, never implicit). */
+  const [knowledgeDoc, setKnowledgeDoc] = useState<number | null>(null);
+  const [webOn, setWebOn] = useState(false);
+  const [showTech, setShowTech] = useState(false);
+  const documents = useAsync(
+    activeId ? () => api.documents.list(activeId) : null,
+    [activeId],
+  );
+
+  const selectedDocName = useMemo(
+    () =>
+      (documents.data?.documents ?? []).find((doc) => doc.id === knowledgeDoc)
+        ?.original_filename ?? null,
+    [documents.data, knowledgeDoc],
+  );
 
   const stages: TraceStage[] = useMemo(
     () => ((ask.result?.trace as { stages?: TraceStage[] } | undefined)?.stages ?? []),
@@ -108,7 +134,20 @@ export default function PipelineLab() {
             icon={<Workflow className="h-4 w-4" />}
             actions={ask.running ? <Loader2 className="h-3.5 w-3.5 animate-spin text-faint" /> : null}
           />
-          <AskControls onRun={ask.run} running={ask.running} />
+          <AskControls
+            onRun={(question, mode) =>
+              ask.run(question, mode, {
+                use_web_search: webOn,
+                document_ids: knowledgeDoc ? [knowledgeDoc] : undefined,
+              })
+            }
+            running={ask.running}
+            documents={documents.data?.documents ?? []}
+            selectedDocumentId={knowledgeDoc}
+            onSelectedDocumentChange={setKnowledgeDoc}
+            webEnabled={webOn}
+            onWebChange={setWebOn}
+          />
         </>
       }
     >
@@ -319,28 +358,111 @@ export default function PipelineLab() {
 
           {finished && ask.answer ? (
             <>
+              {/* ---- 1. what was asked, on what ---------------------- */}
               <Card padded={false} className="animate-fade-up">
                 <CardHeader
-                  title="Live trace"
-                  description="The same run as a log. Times are when each stage finished."
-                  icon={<Terminal className="h-4 w-4" />}
+                  title="Your question"
+                  description="The experiment, exactly as it was run."
+                  icon={<MessageSquareText className="h-4 w-4" />}
+                  actions={
+                    ask.result?.web_sources?.length ? (
+                      <Badge tone="accent">📚 + 🌐 combined</Badge>
+                    ) : (
+                      <Badge tone="neutral">📚 documents only</Badge>
+                    )
+                  }
                 />
-                <div className="px-5 py-4">
-                  <LiveTrace stages={stages} />
-                </div>
-              </Card>
-
-              <Card padded={false} className="animate-fade-up">
-                <CardHeader
-                  title="The answer this pipeline produced"
-                  description={`From ${ask.result?.provider_label ?? "unknown provider"}`}
-                />
-                <div className="px-5 py-4">
-                  <p className="whitespace-pre-wrap text-xs leading-relaxed text-ink">
-                    {ask.answer}
+                <div className="space-y-1.5 px-5 py-4">
+                  <p className="text-sm leading-relaxed text-ink">{ask.question}</p>
+                  <p className="text-2xs leading-relaxed text-faint">
+                    Knowledge source:{" "}
+                    <span className="text-muted">
+                      {selectedDocName ?? "all documents in this workspace"}
+                    </span>{" "}
+                    · Web search:{" "}
+                    <span className="text-muted">
+                      {ask.result?.web_sources?.length
+                        ? `${ask.result.web_sources.length} web results added 🌐`
+                        : "off"}
+                    </span>
                   </p>
                 </div>
               </Card>
+
+              {/* ---- 2. what the AI produced, and the check ------------ */}
+              <Card padded={false} className="animate-fade-up">
+                <CardHeader
+                  title="AI response"
+                  description={`From ${ask.result?.provider_label ?? "unknown provider"}`}
+                  icon={<Sparkles className="h-4 w-4" />}
+                  actions={
+                    ask.result?.grounding ? (
+                      <GroundingBadge grounding={ask.result.grounding} />
+                    ) : undefined
+                  }
+                />
+                <div className="space-y-3 px-5 py-4">
+                  <p className="whitespace-pre-wrap text-xs leading-relaxed text-ink">
+                    {ask.answer}
+                  </p>
+                  {ask.result?.grounding ? (
+                    <p className="border-t border-line pt-2.5 text-2xs leading-relaxed text-muted">
+                      <span className="font-medium text-ink">Verification: </span>
+                      {ask.result.grounding.reason ||
+                        "The answer was checked against the retrieved evidence."}
+                    </p>
+                  ) : null}
+                </div>
+              </Card>
+
+              {/* ---- 3. the measurements, collapsed by default --------- */}
+              <Card padded={false} className="animate-fade-up">
+                <button
+                  type="button"
+                  onClick={() => setShowTech((value) => !value)}
+                  aria-expanded={showTech}
+                  className="flex w-full items-center gap-2 px-5 py-3 text-left"
+                >
+                  <Terminal className="h-4 w-4 text-muted" />
+                  <span className="flex-1 text-xs font-semibold text-ink">
+                    Technical details
+                  </span>
+                  <span className="text-2xs text-faint">
+                    {showTech ? "hide" : "timings, scores & raw trace"}
+                  </span>
+                  <ChevronDown
+                    className={cn(
+                      "h-3.5 w-3.5 text-faint transition-transform",
+                      showTech && "rotate-180",
+                    )}
+                  />
+                </button>
+                {showTech ? (
+                  <div className="animate-slide-down border-t border-line px-5 py-4">
+                    <p className="mb-2 text-2xs leading-relaxed text-faint">
+                      The same run as a log. Times are when each stage finished.
+                    </p>
+                    <LiveTrace stages={stages} />
+                  </div>
+                ) : null}
+              </Card>
+
+              {/* ---- 4. the bridge to Learning Mode -------------------- */}
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-brand/25 bg-brand/6 px-5 py-3.5">
+                <p className="min-w-0 text-xs leading-relaxed text-muted">
+                  Want to understand what happened? Learning Mode walks this run
+                  through the six simple steps, with the technical detail underneath.
+                </p>
+                {ask.result?.conversation_id ? (
+                  <Link
+                    to={`/app/learning/${ask.result.conversation_id}`}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-brand/40 bg-brand/10 px-3 py-1.5 text-2xs font-medium text-brand transition hover:bg-brand/15"
+                  >
+                    <GraduationCap className="h-3.5 w-3.5" />
+                    Open this run in Learning Mode
+                  </Link>
+                ) : null}
+              </div>
             </>
           ) : null}
         </>

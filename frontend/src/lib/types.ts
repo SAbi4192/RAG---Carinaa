@@ -268,6 +268,7 @@ export interface TraceSummary {
   total_ms: number;
   stages: TraceStage[];
   summary: Record<string, unknown>;
+  question?: string;
   note?: string;
 }
 
@@ -330,7 +331,35 @@ export interface Trace {
   total_ms: number;
   stages: TraceStage[];
   summary: Record<string, unknown>;
+  /**
+   * The question THIS answer belongs to. The server resolves the paired user
+   * turn, so the panel can label a run even when the conversation was loaded
+   * from history and no ask-response is in memory.
+   */
+  question: string;
   note: string;
+}
+
+/* ========================================================================== */
+/* Streaming ask (Server-Sent Events)                                          */
+/* ========================================================================== */
+
+export interface AskStreamReady {
+  conversation_id: number;
+  user_message_id: number;
+  trace_id: string;
+  mode: string;
+}
+
+/** A real trace event, forwarded the instant the backend recorded it. */
+export interface AskStreamStage {
+  seq: number;
+  stage: string;
+  label: string;
+  status: string;
+  duration_ms: number;
+  data: Record<string, unknown>;
+  created_at?: string | null;
 }
 
 /* ========================================================================== */
@@ -342,6 +371,7 @@ export interface Language {
   name: string;
   native_name: string;
   speech_code: string;
+  speech_candidates?: string[];
   rtl?: boolean;
 }
 
@@ -370,6 +400,8 @@ export interface SpeechPayload {
   message_id: number;
   language: string;
   speech_code: string;
+  /** Ordered preferred BCP-47 tags. Try each before declaring no voice exists. */
+  speech_candidates?: string[];
   text: string;
   characters: number;
   voice_hint: string;
@@ -524,6 +556,10 @@ export interface AnalyticsOverview {
   /** Count of recorded queries per grounding verdict. */
   grounding?: Record<string, number>;
   grounding_labels?: Record<string, string>;
+  /** Queries that used web augmentation (opt-in, never implicit). */
+  web_searches?: number;
+  /** Mean wall-clock time per query, in milliseconds. */
+  avg_total_ms?: number;
   note?: string;
 }
 
@@ -570,7 +606,50 @@ export interface RetrievalAnalytics {
   };
   providers?: Record<string, number>;
   modes?: Record<string, number>;
+  /**
+   * Which documents the answers actually cited, most-cited first.
+   *
+   * Counted from the stored citations of recent answers - a document with no
+   * citations is simply absent rather than shown as zero, because "never cited"
+   * and "not counted yet" are different facts.
+   */
+  documents?: DocumentUsage[];
+  /** Queries in this window that used web augmentation. */
+  web_searches?: number;
   recent?: RetrievalRecentRow[];
+}
+
+/** One document's share of the citations across recent answers. */
+export interface DocumentUsage {
+  name: string;
+  citations: number;
+  queries: number;
+}
+
+/**
+ * How long one pipeline stage took, aggregated over recorded traces.
+ *
+ * Computed from the persisted `trace_events` rows, so it is the real measured
+ * duration of that stage - not an estimate derived from the total.
+ */
+export interface StageTiming {
+  stage: string;
+  label: string;
+  count: number;
+  avg_ms: number;
+  p50_ms: number;
+  p95_ms: number;
+  total_ms: number;
+  skipped: number;
+  errors: number;
+}
+
+export interface StageAnalytics {
+  total_queries: number;
+  stages: StageTiming[];
+  /** Average end-to-end pipeline time across the same traces. */
+  avg_total_ms?: number;
+  note?: string;
 }
 
 export interface ActivityPoint {
@@ -578,6 +657,10 @@ export interface ActivityPoint {
   queries: number;
   refusals: number;
   citation_errors: number;
+  /** Mean wall-clock time for that day's queries, in milliseconds. */
+  avg_ms?: number;
+  /** Queries that used web augmentation that day. */
+  web_searches?: number;
 }
 
 export interface ActivityAnalytics {

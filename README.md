@@ -21,18 +21,36 @@ Carinaa remembers the chat and understands what a question is pointing at.
   labelled as conversation rather than document evidence - so a previous answer is
   never cited as a source.
 - **Page references.** "Tell me about page 2", "the second page", "p.12" are detected
-  and applied as a metadata filter inside the vector index, not hoped for in the
-  ranking. A page that does not exist, a file with no pages, and an ambiguous document
+  and applied as a metadata filter inside the vector index, not hoped for in the ranking.
+  On a real 176-chunk PDF, "what is on page 5" narrows the search to 4 chunks. A page that does not exist, a file with no pages, and an ambiguous document
   each get their own accurate answer.
 - **Relative references.** "What about the next page?" resolves from the page the
   conversation is already on.
 - **Section references.** "Tell me about the Interviewing Techniques section" matches
   against the section titles actually indexed.
 - **Unit references.** "the third unit", "Unit III", "unit 3" and "unit five" all
-  resolve to the same thing. An embedding cannot bridge an ordinal to a Roman numeral —
+  resolve to the same thing, and the query is then **filtered to that unit's section**
+  so an unrelated unit cannot be returned as evidence. When a document's headings skip a
+  unit (this one has I, IV and V but no II or III), the filter is skipped rather than
+  applied to nothing — over-filtering would hide the answer. An embedding cannot bridge an ordinal to a Roman numeral —
   that is a transformation, not a similarity — so the canonical form is added to the
   search. This also works when the document's headings skip a unit, which filtering
   would not.
+
+---
+
+## Learning Mode cannot disagree with the chat
+
+The Learning panel visualises a real run; it is not a simulation. One rule backs that:
+
+> **The panel never shows a completed pipeline for a run that produced no answer.**
+
+A trace alone is not treated as proof of success — it may belong to an *earlier* run. So
+the current run's outcome is tracked explicitly, a failed run's trace is dropped, and the
+panel then states the failure and hides the previous run's stages behind an explicit
+"Show … for reference" toggle. A browser test asserts this: one successful query, then a
+deterministic failure, then confirm the panel says the run did not complete rather than
+showing checkmarks.
 
 ---
 
@@ -160,15 +178,61 @@ cd frontend && node node_modules/typescript/bin/tsc --noEmit
 cd frontend && node node_modules/vite/bin/vite.js build
 ```
 
-**Current status: 216 pytest tests passing · E2E 44/44 · 23/23 laboratory checks ·
-45/45 browser UI checks with 0 console errors · 6/6 security self-tests · 0 type drift.**
+**Current status: 238 pytest tests passing · 23/23 laboratory checks ·
+50/50 browser UI checks · 8/8 online RAG checks · 6/6 security self-tests · 0 type drift.**
+
+Providers are chained, not single: if Gemini is rate limited, the next Gemini model is tried before falling through to Groq, and whichever model answered is recorded in the trace.
+
+```
+.venv/Scripts/python.exe scripts/verify_online_rag.py   # units, pages, memory live
+.venv/Scripts/python.exe scripts/probe_models.py        # real provider model lists
+```
 
 The browser test drives the real Edge already on the machine (`channel="msedge"`), so it
 needs no Playwright browser download. It checks every route for console errors and failed
-requests, exercises the chat and the panel controls, and verifies there is no horizontal
-overflow at 1440 / 1280 / 1024 / 768 / 390 px.
+requests, exercises the chat and the panel controls, verifies there is no horizontal
+overflow at 1440 / 1280 / 1024 / 768 / 390 px, and asserts the Learning panel never shows
+a completed pipeline when the run produced no answer.
 
 The E2E script registers a throwaway account, so it never touches your data.
+
+Note: the project path contains `&`, so in bash it must be quoted —
+`cd "D:/Academic/Training & Placement/RAG - Carinaa"`. Unquoted, bash mis-parses it.
+
+## Model chaining
+
+Gemini and Groq each have a chain of candidate models. Rate limits are applied **per model**,
+so a 429 on one model often leaves the next with quota. The chain advances only on
+*retryable* failures (429 / 5xx / timeout / unknown model). Which model answered is
+recorded in the trace as `skipped_models` / `models_tried`, so a silent swap to a weaker
+model is impossible.
+
+Observed live — three Gemini models unavailable, chain advanced, answered as **primary**,
+not as a fallback.
+
+```
+1. gemini-2.5-flash      -> LLMError (404)         -> advanced
+2. gemini-3.5-flash      -> RateLimitedError (429) -> advanced
+3. gemini-2.5-flash-lite -> LLMError (404)         -> advanced
+4. gemini-3.6-flash      -> SUCCESS
+
+provider: Gemini   role: primary
+
+skipped_models: ['gemini-2.5-flash(LLMError)', 'gemini-3.5-flash(RateLimitedError)',
+                 'gemini-2.5-flash-lite(LLMError)']
+```
+
+Two design rules:
+
+1. The configured model stays **first**, so an explicit operator choice wins.
+2. Only *retryable* failures advance. A malformed request fails identically on every model,
+   so advancing would multiply latency and bury the real cause.
+
+Model IDs were taken from each provider's **live** model list (`scripts/probe_models.py`)
+rather than guessed — guessing is how a project ships a default that 404s for everyone.
+
+Note: Gemini's free tier allows roughly 20 requests. Under a heavy demo, the chain falls
+through to Groq automatically, labelled as a fallback.
 
 ---
 

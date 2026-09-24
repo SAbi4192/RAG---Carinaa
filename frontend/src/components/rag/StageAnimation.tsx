@@ -33,24 +33,40 @@ function Arrow() {
   );
 }
 
-export function StageAnimation({ stage, className }: { stage: string; className?: string }) {
+export function StageAnimation({
+  stage,
+  question = "",
+  className,
+}: {
+  stage: string;
+  /** The inspected message's question. Used where a stage's picture mentions it. */
+  question?: string;
+  className?: string;
+}) {
   return (
     <div className={cn("rounded-lg border border-line bg-sunken p-3", className)}>
-      {body(stage)}
+      {body(stage, question)}
       <p className="mt-2.5 text-center text-2xs italic text-faint">Conceptual diagram</p>
     </div>
   );
 }
 
-function body(stage: string) {
+function body(stage: string, question: string) {
   switch (stage) {
     case "query_analysis":
       return (
         <>
-          <div className={NODE}>"What is photosynthesis?"</div>
+          <div className={NODE}>“{question || "your question"}”</div>
           <Arrow />
           <div className="flex flex-wrap justify-center gap-1">
-            {["photosynthesis", "plants", "light"].map((word) => (
+            {(question
+              ? question
+                  .toLowerCase()
+                  .split(/[^a-z0-9-]+/)
+                  .filter((w) => w.length >= 3)
+                  .slice(0, 3)
+              : ["query", "topic", "keywords"]
+            ).map((word) => (
               <span key={word} className="rounded border border-line bg-surface px-1.5 py-0.5 text-2xs text-muted">
                 {word}
               </span>

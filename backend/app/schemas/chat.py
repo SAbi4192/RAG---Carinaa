@@ -176,6 +176,14 @@ class TraceOut(BaseModel):
     total_ms: int
     stages: list[TraceStageOut]
     summary: dict[str, Any] = Field(default_factory=dict)
+    # The question THIS answer belongs to.
+    #
+    # Learning Mode is per-message: clicking an answer must show the question that
+    # produced it, and everything below it (scope, context, diagram) has to belong
+    # to that same turn. The client cannot work this out from the message alone -
+    # an assistant row carries no question - so the server resolves the paired user
+    # turn and returns it here.
+    question: str = ""
     note: str = (
         "Every value here was measured while answering your question. Re-ranking and "
         "web search appear as 'skipped' when they did not run."
@@ -188,6 +196,31 @@ class TraceOut(BaseModel):
 class TranslateRequest(BaseModel):
     message_id: int
     language: str = Field(min_length=2, max_length=8)
+
+
+class TextTranslateRequest(BaseModel):
+    """Translate a block of UI/teaching text (the Learning Mode explanation).
+
+    This is deliberately NOT `TranslateRequest`: that one is keyed to a stored
+    answer and caches an `AnswerVariant` against it. Learning Mode translates
+    explanatory prose that was never a grounded answer and must not appear as a
+    variant of one - so it takes the text directly and stores nothing.
+    """
+
+    text: str = Field(min_length=1, max_length=8000)
+    language: str = Field(min_length=2, max_length=8)
+    # The mode the caller is in. Offline refuses rather than reaching for an online
+    # translator, exactly as answer translation does.
+    mode: AiMode | None = None
+
+
+class TextTranslateOut(BaseModel):
+    language: str
+    content: str
+    provider: str = ""
+    model: str = ""
+    warning: str = ""
+    original_unchanged: bool = True
 
 
 class ShortenRequest(BaseModel):
@@ -232,6 +265,10 @@ class SpeechOut(BaseModel):
     message_id: int
     language: str
     speech_code: str
+    #: Ordered preferred BCP-47 tags. The client tries each before declaring no
+    #: matching voice, so "exactly this regional tag is absent, but a sibling
+    #: exists" is a normal read, not a fallback event. See `languages.py`.
+    speech_candidates: list[str] = []
     text: str
     characters: int
     voice_hint: str = ""

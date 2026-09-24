@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="carinaa-doc 1.0 (archify-style, hand-authored)">
+<title>Carinaa — RAG Chat, Learning Mode &amp; Pipeline Workflow Diagram</title>
+<style>
+:root,[data-theme=dark]{--bg:#020617;--panel:#0f172a;--grid:#1e293b;--line:#334155;--text:#f8fafc;--muted:#94a3b8;--dim:#64748b;
+--brand:#6366f1;--brand-ink:#e0e7ff;--accent:#22d3ee;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--violet:#a78bfa;--pink:#f472b6;}
+[data-theme=light]{--bg:#f1f5f9;--panel:#ffffff;--grid:#e2e8f0;--line:#cbd5e1;--text:#0f172a;--muted:#475569;--dim:#94a3b8;
+--brand:#4f46e5;--brand-ink:#ffffff;--accent:#0891b2;--ok:#059669;--warn:#b45309;--bad:#dc2626;--violet:#7c3aed;--pink:#db2777;}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--text);font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif}
+.skip-link{position:absolute;left:-9999px}
+.skip-link:focus{left:8px;top:8px;z-index:50;background:var(--panel);padding:8px 12px;border-radius:8px;border:1px solid var(--brand)}
+.toolbar{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;
+background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.toolbar h1{font-size:14px;margin:0 auto 0 0;font-weight:700;display:flex;align-items:center;gap:8px}
+.toolbar h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--brand);box-shadow:0 0 0 4px color-mix(in srgb,var(--brand) 25%,transparent)}
+.btn{font:inherit;font-size:12px;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer;transition:.15s}
+.btn:hover{border-color:var(--brand);color:var(--brand-ink)}
+.btn[aria-pressed=true]{background:var(--brand);color:#fff;border-color:var(--brand)}
+.hint{font-size:11px;color:var(--dim)}
+main{max-width:1180px;margin:0 auto;padding:20px 16px 64px}
+.intro{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 18px;margin-bottom:18px}
+.intro p{margin:.35em 0;color:var(--muted);font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
+.legend span{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+figure.diagram{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+figure.diagram canvas,figure.diagram svg,#diagram svg{display:block;width:100%;height:auto;background:
+ radial-gradient(circle at 1px 1px,var(--grid) 1px,transparent 0) 0 0/22px 22px}
+figcaption{border-top:1px solid var(--line);padding:10px 16px;font-size:12px;color:var(--dim)}
+svg text{font-family:inherit}
+.node-title{font-weight:700;font-size:13px;fill:var(--text)}
+.node-sub{font-size:10.5px;fill:var(--muted)}
+.edge{fill:none;stroke:var(--line);stroke-width:1.6;marker-end:url(#arrow)}
+.edge.flow{stroke:var(--brand);stroke-width:2;stroke-dasharray:5 4;animation:dash 1s linear infinite}
+@keyframes dash{to{stroke-dashoffset:-18}}
+.chip{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--ink)}
+.node{transition:opacity .2s}
+.dim{opacity:.28}
+@media (prefers-reduced-motion:reduce){.edge.flow{animation:none;stroke-dasharray:none}}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#diagram">Skip to diagram</a>
+<div class="toolbar" role="toolbar" aria-label="Diagram actions">
+  <h1><span class="dot" aria-hidden="true"></span>Carinaa — RAG Workflow</h1>
+  <button class="btn" id="t-present" aria-pressed="false" title="Toggle the flowing answer animation">▶ Flow</button>
+  <button class="btn" id="t-theme" title="Toggle light / dark">◐ Theme</button>
+  <button class="btn" id="t-print" title="Print or save as PDF">⎙ Print</button>
+  <span class="hint">Hover a stage for its role · self-contained · offline</span>
+</div>
+<main>
+  <div class="intro">
+    <p><strong>Two experiences, one RAG engine.</strong> Normal Chat answers directly with no pipeline animation. Learning Mode attaches a per-message RAG trace to every assistant reply.</p>
+    <p>Conversation history is <em>context</em>, never document evidence — it is never citable. The same pipeline serves Chat, Learning Mode and the Playground.</p>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw" style="background:var(--brand)"></i>Retrieval path</span>
+      <span><i class="sw" style="background:var(--accent)"></i>Generation</span>
+      <span><i class="sw" style="background:var(--ok)"></i>Trust / grounding</span>
+      <span><i class="sw" style="background:var(--violet)"></i>Ingestion (offline, once)</span>
+      <span><i class="sw" style="background:var(--pink)"></i>Learning Mode</span>
+      <span><i class="sw" style="background:var(--warn)"></i>Memory / scope</span>
+    </div>
+  </div>
+  <figure class="diagram">
+    <div id="diagram">
+      <svg viewBox="0 0 1120 892" role="img" aria-labelledby="svg-title svg-desc" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMin meet">
+        <title id="svg-title">Carinaa RAG pipeline</title>
+        <desc id="svg-desc">Ingestion, then the nine online RAG stages, the per-message Learning Mode trace, and the supporting UX features.</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--line)"/>
+          </marker>
+          <linearGradient id="gcard" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0" stop-color="var(--panel)"/><stop offset="1" stop-color="var(--bg)"/>
+          </linearGradient>
+        </defs>
+
+        <!-- INGESTION (offline, once) -->
+        <g transform="translate(40 32)">
+          <text class="node-sub" x="0" y="-2" fill="var(--violet)" font-weight="700" letter-spacing="1.5">DOCUMENT INGESTION — happens once, then reused</text>
+          <g class="node" data-n="ingest">
+            <rect width="210" height="66" rx="12" fill="url(#gcard)" stroke="var(--violet)" stroke-opacity=".5"/>
+            <text class="node-title" x="14" y="26" fill="var(--violet)">1 · Upload &amp; parse</text>
+            <text class="node-sub" x="14" y="46">PDF / DOCX / TXT · pages marked</text>
+          </g>
+          <path class="edge" d="M210 33 H250" data-flow="ingest2"/>
+          <g class="node" transform="translate(250 0)" data-n="ingest2">
+            <rect width="210" height="66" rx="12" fill="url(#gcard)" stroke="var(--violet)" stroke-opacity=".5"/>
+            <text class="node-title" x="14" y="26" fill="var(--violet)">2 · Chunking</text>
+            <text class="node-sub" x="14" y="46">overlapping passages (&lt;chunk&gt;)</text>
+          </g>
+          <path class="edge" d="M460 33 H500" data-flow="ingest3"/>
+          <g class="node" transform="translate(500 0)" data-n="ingest3">
+            <rect width="210" height="66" rx="12" fill="url(#gcard)" stroke="var(--violet)" stroke-opacity=".5"/>
+            <text class="node-title" x="14" y="26" fill="var(--violet)">3 · Embeddings</text>
+            <text class="node-sub" x="14" y="46">MiniLM vector per chunk</text>
+          </g>
+          <path class="edge" d="M710 33 H750" data-flow="store"/>
+          <g class="node" transform="translate(750 0)" data-n="store">
+            <rect width="278" height="66" rx="12" fill="url(#gcard)" stroke="var(--violet)" stroke-opacity=".8" stroke-width="1.8"/>
+            <text class="node-title" x="14" y="26" fill="var(--violet)">Vector store (per workspace)</text>
+            <text class="node-sub" x="14" y="46">SQLite-backed vectors + chunks → scoped at query time</text>
+          </g>
+        </g>
+
+        <path class="edge" d="M1028 65 V120 H440" data-flow="entry"/>
+
+        <!-- ENTRY / UX -->
+        <g transform="translate(40 96)">
+          <text class="node-sub" x="0" y="-2" fill="var(--warn)" font-weight="700" letter-spacing="1.5">REQUEST &amp; SCOPE — per chat turn</text>
+          <g class="node" data-n="entry">
+            <rect width="210" height="66" rx="12" fill="url(#gcard)" stroke="var(--warn)" stroke-opacity=".55"/>
+            <text class="node-title" x="14" y="26" fill="var(--warn)">Unified composer</text>
+            <text class="node-sub" x="14" y="46">[+] [Ask…] [Web] [Send]</text>
+          </g>
+          <path class="edge" d="M210 33 H250" data-flow="mem"/>
+          <g class="node" transform="translate(250 0)" data-n="mem">
+            <rect width="230" height="66" rx="12" fill="url(#gcard)" stroke="var(--warn)" stroke-opacity=".55"/>
+            <text class="node-title" x="14" y="26" fill="var(--warn)">Conversation memory</text>
+            <text class="node-sub" x="14" y="46">follow-ups resolve “its”, “why” from turns</text>
+          </g>
+          <path class="edge" d="M480 33 H520" data-flow="scope"/>
+          <g class="node" transform="translate(520 0)" data-n="scope">
+            <rect width="250" height="66" rx="12" fill="url(#gcard)" stroke="var(--warn)" stroke-opacity=".55"/>
+            <text class="node-title" x="14" y="26" fill="var(--warn)">Multi-doc chat scope</text>
+            <text class="node-sub" x="14" y="46">N selected docs · else whole workspace</text>
+          </g>
+        </g>
+
+        <path class="edge" d="M770 129 H1080 1110 V188 H360" data-flow="qa"/>
+
+        <!-- PIPELINE: 9 STAGES as two columns -->
+        <g transform="translate(40 188)">
+          <text class="node-sub" x="0" y="-2" fill="var(--brand)" font-weight="700" letter-spacing="1.5">RAG PIPELINE — the same 9 stages behind every answer</text>
+        </g>
+
+        <!-- column 1 -->
+        <g transform="translate(48 224)" font-size="0">
+          <g class="node" data-n="qa"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--brand)" stroke-opacity=".5"/><text class="node-sub" style="font-size:0"></text><text class="node-title" x="14" y="25" font-size="13">① Query Analysis</text><text class="node-sub" x="14" y="45" font-size="11">understand &amp; clean the question</text></g>
+          <path class="edge" d="M160 60 V78" data-flow="qe"/>
+          <g class="node" transform="translate(0 78)" data-n="qe"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--brand)" stroke-opacity=".5"/><text class="node-title" x="14" y="25" font-size="13">② Query Embedding</text><text class="node-sub" x="14" y="45" font-size="11">question → numbers, same model</text></g>
+          <path class="edge" d="M160 138 V156" data-flow="vs"/>
+          <g class="node" transform="translate(0 156)" data-n="vs"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--brand)" stroke-opacity=".5"/><text class="node-title" x="14" y="25" font-size="13">③ Vector Search</text><text class="node-sub" x="14" y="45" font-size="11">cosine over scoped chunks</text></g>
+          <path class="edge" d="M160 216 V234" data-flow="cand"/>
+          <g class="node" transform="translate(0 234)" data-n="cand"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--brand)" stroke-opacity=".5"/><text class="node-title" x="14" y="25" font-size="13">④ Candidate Retrieval</text><text class="node-sub" x="14" y="45" font-size="11">keep best N as candidates</text></g>
+          <path class="edge" d="M160 294 V312" data-flow="rr"/>
+          <g class="node" transform="translate(0 312)" data-n="rr"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--brand)" stroke-opacity=".5"/><text class="node-title" x="14" y="25" font-size="13">⑤ Re-ranking</text><text class="node-sub" x="14" y="45" font-size="11">cross-encoder re-orders · optional</text></g>
+        </g>
+
+        <!-- column 2 -->
+        <g transform="translate(410 224)" font-size="0">
+          <g class="node" data-n="ctx"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--accent)" stroke-opacity=".55"/><text class="node-title" x="14" y="25" font-size="13">⑥ Context Building</text><text class="node-sub" x="14" y="45" font-size="11">numbered [1][2] evidence block</text></g>
+          <path class="edge" d="M160 60 V78" data-flow="gen"/>
+          <g class="node" transform="translate(0 78)" data-n="gen"><rect width="320" height="66" rx="11" fill="url(#gcard)" stroke="var(--accent)" stroke-opacity=".8" stroke-width="1.8"/><text class="node-title" x="14" y="24" font-size="13">⑦ LLM Generation</text><text class="node-sub" x="14" y="43" font-size="11">question + evidence → answer</text><text class="node-sub" x="14" y="58" font-size="10.5" fill="var(--dim)">Gemini ▸ Groq ▸ local · adaptive depth</text></g>
+          <path class="edge" d="M160 144 V162" data-flow="cite"/>
+          <g class="node" transform="translate(0 162)" data-n="cite"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--ok)" stroke-opacity=".55"/><text class="node-title" x="14" y="25" font-size="13">⑧ Citation Resolution</text><text class="node-sub" x="14" y="45" font-size="11">tie [n] back to real passages</text></g>
+          <path class="edge" d="M160 222 V240" data-flow="gnd"/>
+          <g class="node" transform="translate(0 240)" data-n="gnd"><rect width="320" height="60" rx="11" fill="url(#gcard)" stroke="var(--ok)" stroke-opacity=".8" stroke-width="1.8"/><text class="node-title" x="14" y="25" font-size="13">⑨ Grounding check</text><text class="node-sub" x="14" y="45" font-size="11">supported · partial · refuse (honest)</text></g>
+        </g>
+        <path class="edge" d="M368 452 H382 V352 H426" data-flow="ctx"/>
+
+        <!-- per-message trace storage -->
+        <g transform="translate(784 224)">
+          <g class="node" data-n="trace"><rect width="288" height="378" rx="16" fill="url(#gcard)" stroke="var(--pink)" stroke-opacity=".65"/>
+          <text class="node-title" x="16" y="28" font-size="13" fill="var(--pink)">Per-message RAG trace (DB)</text>
+          <text class="node-sub" x="16" y="48" font-size="11">Assistant msg ⇄ one trace each, keyed</text>
+          <text class="node-sub" x="16" y="62" font-size="11">by assistant_message_id</text>
+          <line x1="16" y1="76" x2="272" y2="76" stroke="var(--line)"/>
+          <g class="node-sub" stroke="var(--pink)" fill="none">
+            <rect x="18" y="90" width="252" height="26" rx="6" stroke-opacity=".5"/><text class="chip" x="28" y="107">msg #1  · 9 stages ✓ 8.6 s</text>
+            <rect x="18" y="122" width="252" height="26" rx="6" stroke-opacity=".5"/><text class="chip" x="28" y="139">msg #2  · rr ✗ failed, shown</text>
+            <rect x="18" y="154" width="252" height="26" rx="6" stroke-opacity=".35"/><text class="chip" x="28" y="171" opacity=".5">msg #3  · — not used</text>
+          </g>
+          <rect x="16" y="196" width="256" height="74" rx="10" fill="color-mix(in srgb,var(--pink) 10%,var(--panel))" stroke="var(--pink)" stroke-opacity=".5"/>
+          <text class="node-sub" x="28" y="216" fill="var(--pink)" font-size="11" font-weight="700">LEARNING PANEL (§9)</text>
+          <text class="node-sub" x="28" y="233" font-size="10.5">selected msg · simple explanation</text>
+          <text class="node-sub" x="28" y="248" font-size="10.5">replay ✓⏳✗— · context · scope</text>
+          <text class="node-sub" x="28" y="263" font-size="10.5">per-msg diagram · trace · #translate</text>
+          <g transform="translate(16 284)">
+            <rect width="256" height="34" rx="8" fill="none" stroke="var(--line)"/>
+            <text class="node-sub" x="10" y="14" font-size="10" fill="var(--dim)">CHAT MODE (§1): answer only,</text>
+            <text class="node-sub" x="10" y="27" font-size="10" fill="var(--dim)">no animation · trace stored, clickable</text>
+          </g>
+          <g transform="translate(16 330)">
+            <rect width="256" height="34" rx="8" fill="none" stroke="var(--line)"/>
+            <text class="node-sub" x="10" y="14" font-size="10" fill="var(--dim)">§12 refuse honestly + suggest, no</text>
+            <text class="node-sub" x="10" y="27" font-size="10" fill="var(--dim)">invent · §13 citations kept</text>
+          </g>
+          </g>
+        </g>
+        <path class="edge" d="M1108 463 H1085" data-flow="gnd"/>
+
+        <!-- SIDE FEATURES ribbon -->
+        <g transform="translate(40 660)">
+          <text class="node-sub" x="0" y="-6" fill="var(--accent)" font-weight="700" letter-spacing="1.5">CROSS-CUTTING UX / FEATURES (not pipeline stages)</text>
+          <g class="node" data-n="read" transform="translate(0 6)"><rect width="246" height="72" rx="12" fill="url(#gcard)" stroke="var(--line)"/>
+          <text class="node-title" x="14" y="26" font-size="12.5">Read Aloud (§3)</text>
+          <text class="node-sub" x="14" y="44" font-size="10.5">browser voice · candidate order</text>
+          <text class="node-sub" x="14" y="58" font-size="10.5">en→en-US→en-IN · no alarm on fallback</text></g>
+          <g class="node" data-n="translate" transform="translate(266 6)"><rect width="256" height="72" rx="12" fill="url(#gcard)" stroke="var(--line)"/>
+          <text class="node-title" x="14" y="26" font-size="12.5">Translate (§6, §9.7)</text>
+          <text class="node-sub" x="14" y="44" font-size="10.5">+ Tanglish (Tamil in English letters)</text>
+          <text class="node-sub" x="14" y="58" font-size="10.5">panel translate via /translate-text</text></g>
+          <g class="node" data-n="scroll" transform="translate(542 6)"><rect width="248" height="72" rx="12" fill="url(#gcard)" stroke="var(--line)"/>
+          <text class="node-title" x="14" y="26" font-size="12.5">Answer position (§10)</text>
+          <text class="node-sub" x="14" y="44" font-size="10.5">anchor new Q at top · read from start</text>
+          <text class="node-sub" x="14" y="58" font-size="10.5">near-bottom follow only</text></g>
+          <g class="node" data-n="pg" transform="translate(810 6)"><rect width="262" height="72" rx="12" fill="url(#gcard)" stroke="var(--line)"/>
+          <text class="node-title" x="14" y="26" font-size="12.5">Playground (§8) / /app/playground</text>
+          <text class="node-sub" x="14" y="44" font-size="10.5">9 lab benches · same real code,</text>
+          <text class="node-sub" x="14" y="58" font-size="10.5">per-stage trace, nothing faked</text></g>
+        </g>
+
+        <!-- legend foot -->
+        <text class="node-sub" x="40" y="834" font-size="11" fill="var(--dim)">Flow = one user turn. Ingestion and Chat run through the SAME retriever + generator as the playground. Conversation context is sent to the model but is never a citable source.</text>
+        <text class="node-sub" x="40" y="852" font-size="11" fill="var(--dim)">Every assistant message owns its trace (✓ done, ⏳ running, ✗ failed, — not reached) with real timings.</text>
+      </svg>
+    </div>
+    <figcaption id="cap">Hover a node to see what it does. This page is self-contained and works offline.</figcaption>
+  </figure>
+
+  <style>
+  .note{margin-top:18px;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+  .note b{color:var(--text)}
+  .note div{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:12px;color:var(--muted)}
+  </style>
+  <div class="note" id="notes"></div>
+</main>
+<script>
+(function(){
+  var svg=document.querySelector("#diagram svg");
+  var cap=document.getElementById("cap");
+  var DEFAULT="Hover a node to see what it does.";
+  var NOTES={
+    qa:["Query Analysis","Reads and normalises the question; detects a follow-up and resolves \"its\"/\"why\" from chat context before searching."],
+    qe:["Query Embedding","Runs the question through the same MiniLM model as the docs so the vectors are comparable."],
+    vs:["Vector Search","Cosine similarity over the scoped chunks in the store."],
+    cand:["Candidate Retrieval","Keeps the top pool. Annotated with retrieval_scope (chat vs workspace), doc ids, best score."],
+    rr:["Re-ranking","Optional cross-encoder over candidates. The panel shows it failed if it fails."],
+    ctx:["Context Building","Assembles numbered evidence [1][2]. Budget applied, drops reported, not silent."],
+    gen:["LLM Generation","Question + evidence → answer. Depth adapts to the question; provider disclosed, no silent fallback."],
+    cite:["Citation Resolution","Links [n] to real passages; fabricated markers flagged."],
+    gnd:["Grounding","Verdict: supported / partial / refuse. A refusal is honest, not a failure."],
+    store:["Vector store","Per-workspace vectors+chunks; the chat scope filters them at query time — retrieval-enforced, not a prompt hint."],
+    mem:["Conversation memory","Carries turns into the query so follow-ups resolve. History ≠ evidence."],
+    scope:["Multi-doc scope","Select/deselect several docs for the chat; empty = whole workspace."],
+    trace:["Per-message trace","Each assistant row has the trace for its own run; click a bubble to load it."],
+    read:["Read Aloud","Browser speech synthesis with ordered voice candidates — a missing regional voice is normal."],
+    translate:["Translate","All existing languages plus Tanglish; the Learning panel has its own translator."],
+    scroll:["Auto-scroll","A new question anchors at top; only follows the bottom if already there."],
+    pg:["Playground","Each pipeline stage has a bench running the real code with real trace timings."],
+    entry:["Composer","+ and Web Search and Send sit in one input bar."],
+    ingest:["Ingestion","Upload→parse→chunk→embed→store. Once per doc, reused every turn."]
+  };
+  Array.prototype.forEach.call(svg.querySelectorAll("[data-n]"), function(g){
+    var k=g.getAttribute("data-n"); var d=NOTES[k]; if(!d) return;
+    g.style.cursor="help";
+    g.setAttribute("tabindex","0");
+    g.setAttribute("aria-label",d[0]+": "+d[1]);
+    g.addEventListener("mouseenter",function(){cap.textContent="● "+d[0]+" — "+d[1]; });
+    g.addEventListener("focus",function(){cap.textContent="● "+d[0]+" — "+d[1]; });
+    g.addEventListener("mouseleave",function(){cap.textContent=DEFAULT; });
+  });
+  // theme
+  var saved=localStorage.getItem("carinaa-theme"); if(saved) document.documentElement.setAttribute("data-theme",saved);
+  document.getElementById("t-theme").addEventListener("click",function(){
+    var n=document.documentElement.getAttribute("data-theme")==="dark"?"light":"dark";
+    document.documentElement.setAttribute("data-theme",n); localStorage.setItem("carinaa-theme",n);
+  });
+  var flowBtn=document.getElementById("t-present");
+  flowBtn.addEventListener("click",function(){
+    var on=flowBtn.getAttribute("aria-pressed")==="true";
+    flowBtn.setAttribute("aria-pressed",String(!on));
+    Array.prototype.forEach.call(svg.querySelectorAll(".edge"), function(p){ p.classList.toggle("flow",!on); });
+  });
+  document.getElementById("t-print").addEventListener("click",function(){window.print();});
+  // notes grid
+  var order=["ingest","store","entry","mem","scope","qa","qe","vs","cand","rr","ctx","gen","cite","gnd","trace","read","translate","scroll","pg"];
+  var h=""; for(var i=0;i<order.length;i++){var d=NOTES[order[i]]; if(d) h+="<div><b>"+d[0]+"</b><br>"+d[1]+"</div>";}
+  document.getElementById("notes").innerHTML=h;
+})();
+</script>
+</body>
+</html>

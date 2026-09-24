@@ -25,6 +25,8 @@ import type {
   AnalyticsOverview,
   AskRequest,
   AskResponse,
+  AskStreamReady,
+  AskStreamStage,
   Capabilities,
   ChunkPreview,
   Conversation,
@@ -47,6 +49,7 @@ import type {
   SecurityReport,
   ShortenLevelInfo,
   SpeechPayload,
+  StageAnalytics,
   SupportedTypes,
   SystemStats,
   TokenResponse,
@@ -414,6 +417,93 @@ export const api = {
     ask: (payload: AskRequest) =>
       request<AskResponse>("/chat/ask", { method: "POST", body: payload }),
 
+    /** Ask a question, receiving REAL server-pushed events.
+     *
+     * `fetch` + a ReadableStream reader, not `EventSource`, because the request
+     * must carry an Authorization header and a JSON body. That is the standard
+     * way to consume POST-over-SSE, and it is why the backend and the UI can
+     * share one event protocol.
+     *
+     * Callback contract (matches the backend exactly):
+     *   onReady  - the user turn is persisted; caller learns its ids
+     *   onStage  - a real trace event, fired the moment that stage finished
+     *   onToken  - a real provider fragment, in order
+     *   onDone   - the canonical, cited, grounded answer + trace summary
+     *   onError  - a failure during streaming; may carry a partial trace
+     *
+     * IMPORTANT: the answer is only canonical when `onDone` fires. A mid-stream
+     * `onError` means the streamed text was a draft that should be discarded -
+     * never leave partial streamed text committed as if it were the answer.
+     *
+     * Pass an AbortSignal to cancel (e.g. the user stopped the generation).
+     */
+    askStream: async (
+      payload: AskRequest,
+      handlers: {
+        onReady?: (info: AskStreamReady) => void;
+        onStage?: (event: AskStreamStage) => void;
+        onToken?: (text: string) => void;
+        onDone?: (response: AskResponse) => void;
+        onError?: (err: ApiError) => void;
+      },
+      signal?: AbortSignal,
+    ): Promise<void> => {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      };
+      const token = getToken();
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      let response: Response;
+      try {
+        response = await fetch(`/api/chat/ask/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal,
+        });
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+        throw new ApiError(
+          "Could not reach the Carinaa server. Is the backend running?",
+          0,
+          "network_error",
+        );
+      }
+
+      // A non-2xx BEFORE the stream starts is a normal HTTP error (bad request,
+      // ambiguous page, expired session). Surface it as `error` so the caller has
+      // one code path, but keep the status for auth detection.
+      if (!response.ok) {
+        let envelope: { error?: { code?: string; message?: string; detail?: Record<string, unknown> } } | null = null;
+        try {
+          envelope = await response.json();
+        } catch {
+          /* an empty body still means "something failed"; we use the status. */
+        }
+        handlers.onError?.(
+          new ApiError(
+            envelope?.error?.message || `Request failed with status ${response.status}.`,
+            response.status,
+            envelope?.error?.code || "error",
+            envelope?.error?.detail || {},
+          ),
+        );
+        return;
+      }
+
+      if (!response.body) {
+        handlers.onError?.(
+          new ApiError("The server did not return a stream.", 0, "no_stream"),
+        );
+        return;
+      }
+
+      await consumeSse(response.body, handlers);
+    },
+
+
     retrieve: (payload: {
       workspace_id: number;
       question: string;
@@ -446,6 +536,21 @@ export const api = {
       request<Variant>("/features/translate", {
         method: "POST",
         body: { message_id: messageId, language },
+      }),
+
+    // Translate the Learning panel's explanation. Deliberately separate from
+    // `translate`: teaching prose is not a grounded answer and must not be
+    // stored as a variant of one, so this endpoint takes text and caches nothing.
+    translateText: (text: string, language: string) =>
+      request<{
+        language: string;
+        content: string;
+        provider?: string;
+        model?: string;
+        warning?: string;
+      }>("/features/translate-text", {
+        method: "POST",
+        body: { text, language },
       }),
 
     shorten: (messageId: number, level: string) =>
@@ -510,6 +615,16 @@ export const api = {
       request<ActivityAnalytics>(
         `/analytics/activity?days=${days}${workspaceId ? `&workspace_id=${workspaceId}` : ""}`,
       ),
+    /**
+     * Per-stage timings aggregated from the recorded traces.
+     *
+     * This is the one call that makes the RAG architecture visible as data: how
+     * long each real stage took, averaged over the questions actually asked.
+     */
+    stages: (workspaceId?: number, days = 30) =>
+      request<StageAnalytics>(
+        `/analytics/stages?days=${days}${workspaceId ? `&workspace_id=${workspaceId}` : ""}`,
+      ),
   },
 
   /* ---- evaluation ---------------------------------------------------- */
@@ -524,5 +639,195 @@ export const api = {
     metricsReference: () => request<Record<string, unknown>>("/evaluation/metrics-reference"),
   },
 };
+
+/**
+ * Parse an SSE stream from a fetch Response body and dispatch typed events.
+ *
+ * The SSE spec separates fields with `\n`, and events with `\n\n`; multi-line
+ * payload fields concatenate their `data:` lines back into one string. The
+ * browser `EventSource` does this for you, but we cannot use EventSource here
+ * (POST + Authorization header). This is a small, spec-faithful parser - not a
+ * regex splitter - because a naive split on `\n\n` would corrupt any token that
+ * happens to end in a line break at a chunk boundary.
+ *
+ * Dispatch contract:
+ *   ready  -> onReady  {conversation_id, user_message_id, trace_id, mode}
+ *   stage  -> onStage  {seq, stage, label, status, duration_ms, data, created_at}
+ *   token  -> onToken   string fragment, in order
+ *   done   -> onDone    AskResponse
+ *   error  -> onError   an ApiError constructed from the backend envelope
+ */
+async function consumeSse(
+  body: ReadableStream<Uint8Array>,
+  handlers: {
+    onReady?: (info: AskStreamReady) => void;
+    onStage?: (event: AskStreamStage) => void;
+    onToken?: (text: string) => void;
+    onDone?: (response: AskResponse) => void;
+    onError?: (err: ApiError) => void;
+  },
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+
+  // `buffer` holds the decoded but not-yet-parsed tail of the byte stream.
+  // It always represents a whole prefix of SSE text (so a `\n` boundary cannot
+  // land inside a multi-byte character), and is the cross-call state.
+  let buffer = "";
+
+  // Once `done` or `error` has been dispatched the stream is finished. Without
+  // this flag a clean close after `done` would look like a truncation.
+  let terminal = false;
+
+  const dispatch = (event: string, fields: Record<string, string>) => {
+    const raw = (fields.data ?? "").trim();
+    if (!raw) return;
+    let payload: any;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      // A malformed frame should never crash the client. The stream may still
+      // contain real events; skip this one and keep reading.
+      return;
+    }
+    switch (event) {
+      case "ready": {
+        try {
+          handlers.onReady?.(payload as AskStreamReady);
+        } catch {
+          /* handler error, not a transport error */
+        }
+        break;
+      }
+      case "stage": {
+        try {
+          handlers.onStage?.(normalizeStageEvent(payload));
+        } catch {
+          /* keep streaming */
+        }
+        break;
+      }
+      case "token": {
+        const text = typeof payload?.text === "string" ? payload.text : "";
+        if (text) {
+          try {
+            handlers.onToken?.(text);
+          } catch {
+            /* keep streaming */
+          }
+        }
+        break;
+      }
+      case "done": {
+        terminal = true;
+        try {
+          handlers.onDone?.(payload as AskResponse);
+        } catch {
+          /* stream is over anyway */
+        }
+        break;
+      }
+      case "error": {
+        terminal = true;
+        const info = payload?.error ?? payload ?? {};
+        try {
+          handlers.onError?.(
+            new ApiError(
+              info.message || "The answer could not be completed.",
+              Number(info.status ?? 500),
+              info.code || "stream_error",
+              info.detail || {},
+            ),
+          );
+        } catch {
+          /* handler error - the stream is over */
+        }
+        break;
+      }
+    }
+  };
+
+  // Parse complete frames. The `event:` field is single-occurrence per frame;
+  // `data:` lines concatenate with `\n` per the spec.
+  const flushFrame = (frame: string) => {
+    let eventName = "message";
+    const fields: Record<string, string> = {};
+    let dataLines: string[] = [];
+    for (const line of frame.split("\n")) {
+      if (line === "" || line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      if (colon < 0) {
+        // field-name-only per spec ("event" line as a boolean marker, etc.).
+        continue;
+      }
+      const key = line.slice(0, colon);
+      let value = line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (key === "event") eventName = value;
+      else if (key === "data") dataLines.push(value);
+      else fields[key] = value;
+    }
+    if (dataLines.length > 0) {
+      fields.data = dataLines.join("\n");
+      dispatch(eventName, fields);
+    }
+  };
+
+  // Main loop - we do not close on first EOF; an `error` frame may be the last.
+  outer: while (true) {
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      handlers.onError?.(
+        new ApiError("The streamed connection was lost.", 0, "network_error"),
+      );
+      return;
+    }
+    const { done, value } = chunk;
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a double newline. We split on the strict form
+    // ("\n\n") rather than on any single "\n", which would emit half-frames
+    // every time a payload token happened to contain a newline.
+    let sep: number;
+    while ((sep = buffer.indexOf("\n\n")) >= 0) {
+      const frame = buffer.slice(0, sep);
+      const remainder = buffer.slice(sep + 2);
+      buffer = remainder;
+      flushFrame(frame);
+    }
+  }
+
+  // Drain the decoder (rare - some encoders emit a trailing partial byte
+  // sequence at the close).
+  const tail = decoder.decode();
+  if (tail) buffer += tail;
+  if (buffer.trim()) flushFrame(buffer.trimEnd());
+
+  // The stream closed without `done` or `error`. That is a truncated
+  // generation - surface it. Don't leave the user staring at a half answer.
+  // (An `AbortError` in `reader.read()` is a deliberate stop, not a failure,
+  // and we have already returned from the loop; this code path is for an
+  // unexpected TCP close.)
+  if (!terminal) {
+    handlers.onError?.(
+      new ApiError("The answer ended before it finished.", 0, "stream_truncated"),
+    );
+  }
+}
+
+function normalizeStageEvent(payload: any): AskStreamStage {
+  return {
+    seq: Number(payload.seq ?? 0),
+    stage: String(payload.stage ?? ""),
+    label: String(payload.label ?? payload.stage ?? ""),
+    status: String(payload.status ?? "ok"),
+    duration_ms: Number(payload.duration_ms ?? 0),
+    data: (payload.data ?? {}) as Record<string, unknown>,
+    created_at: payload.created_at ?? null,
+  };
+}
 
 export type { Grounding };

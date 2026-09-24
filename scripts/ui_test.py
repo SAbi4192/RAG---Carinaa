@@ -47,6 +47,9 @@ VIEWPORTS = [
 results: list[tuple[str, bool, str]] = []
 
 
+expected_bad_request = False
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, bool(ok), detail))
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
@@ -181,15 +184,19 @@ def main() -> int:
             check("sources section rendered", "source" in body.lower())
             check("retrieval detail rendered", "retrieval detail" in body.lower())
 
-        # ---- 3. The three-line scope control actually toggles ----------
+        # ---- 3. The scope checklist actually toggles ------------------------
+        # The control is the ChatDocuments checklist above the composer. Its header
+        # always reads "Searching ..." (n of m / all), and expanding it reveals the
+        # tick-list promise line. (Old assertion looked for "This chat" /
+        # "Unchecking excludes" — labels the checklist redesign replaced.)
         print("\n3. The chat scope control toggles")
-        scope_button = page.locator("button:has-text('This chat')").first
+        scope_button = page.locator("button:has-text('Searching')").first
         check("scope control is present", scope_button.count() > 0)
         if scope_button.count():
-            expanded_before = page.locator("text=Unchecking excludes").count()
+            expanded_before = page.locator("text=Tick the documents").count()
             scope_button.click()
             page.wait_for_timeout(500)
-            expanded_after = page.locator("text=Unchecking excludes").count()
+            expanded_after = page.locator("text=Tick the documents").count()
             check(
                 "clicking expands it",
                 expanded_after > expanded_before,
@@ -199,7 +206,7 @@ def main() -> int:
             page.wait_for_timeout(400)
             check(
                 "clicking again collapses it",
-                page.locator("text=Unchecking excludes").count() < expanded_after,
+                page.locator("text=Tick the documents").count() < expanded_after,
             )
 
         # ---- 4. Learning Mode: navigation stays put --------------------
@@ -216,9 +223,12 @@ def main() -> int:
         page.reload(wait_until="networkidle")
         page.wait_for_timeout(800)
         check("survives a refresh", "/app/learning" in page.url, f"url={page.url}")
+        # The panel header is "🔬 How Carinaa answered" (redesign label). The old
+        # assertion looked for "RAG Learning", a string no component has ever
+        # rendered after the Learning Mode rebuild.
         check(
             "the pipeline panel rendered",
-            page.locator("text=RAG Learning").count() > 0,
+            page.locator("text=How Carinaa answered").count() > 0,
         )
 
         # ---- 5. Panels menu -------------------------------------------
@@ -272,6 +282,104 @@ def main() -> int:
             page.keyboard.press("Escape")
             page.wait_for_timeout(500)
 
+        # ---- 5b. Waiting indicator: plain on Chat, animated in Learning Mode
+        print("\n5b. Waiting indicator differs by mode")
+        page.set_viewport_size({"width": 1440, "height": 900})
+
+        STAGE_NAMES = (
+            "Query Analysis",
+            "Query Embedding",
+            "Vector Search",
+            "Candidate Retrieval",
+            "Context Building",
+            "LLM Generation",
+            "Grounding",
+        )
+
+        def seen_stage_names() -> set[str]:
+            body = page.inner_text("body")
+            return {name for name in STAGE_NAMES if name in body}
+
+        # (a) Chat: must NOT cycle stage names.
+        page.goto(f"{BASE}/app/chat/{conversation}", wait_until="networkidle")
+        page.wait_for_timeout(500)
+        chat_box = page.locator("textarea").first
+        chat_box.fill("What is a hypervisor?")
+        chat_box.press("Enter")
+
+        chat_seen: set[str] = set()
+        for _ in range(20):
+            page.wait_for_timeout(250)
+            chat_seen |= seen_stage_names()
+            if "Sources" in page.inner_text("body"):
+                break
+        check(
+            "Chat shows NO stage-name animation",
+            not chat_seen,
+            f"saw {sorted(chat_seen)} (should be none on plain Chat)",
+        )
+
+        # (b) Learning Mode: must cycle stage names.
+        page.goto(f"{BASE}/app/learning/{conversation}", wait_until="networkidle")
+        page.wait_for_timeout(600)
+        learn_box = page.locator("textarea").first
+        learn_box.fill("What is a hypervisor?")
+        learn_box.press("Enter")
+        learn_seen: set[str] = set()
+        for _ in range(24):
+            page.wait_for_timeout(250)
+            learn_seen |= seen_stage_names()
+            if "Sources" in page.inner_text("body"):
+                break
+        check(
+            "Learning Mode DOES animate stage names",
+            len(learn_seen) >= 3,
+            f"saw {sorted(learn_seen)}",
+        )
+
+        # ---- 6b. Learning Mode must never show a completed pipeline
+        #          when there is no answer (the brief's most important bug).
+        print("\n6b. Failed run must not show a completed pipeline")
+        page.set_viewport_size({"width": 1440, "height": 900})
+
+        # A successful run first, so there IS a completed pipeline to be tempted by.
+        page.goto(f"{BASE}/app/learning/{conversation}", wait_until="networkidle")
+        page.wait_for_timeout(600)
+        ok_composer = page.locator("textarea").first
+        ok_composer.fill("What is a hypervisor?")
+        ok_composer.press("Enter")
+        page.wait_for_timeout(14000)
+
+        succeeded = "How Carinaa answered" in page.inner_text("body")
+        check("a successful Learning run renders the panel", succeeded)
+
+        # Now force a deterministic failure: a page number that cannot exist. The
+        # backend refuses with 400 before any generation happens.
+        bad_composer = page.locator("textarea").first
+        bad_composer.fill("Tell me about page 9999")
+        bad_composer.press("Enter")
+        page.wait_for_timeout(6000)
+        # This run is MEANT to fail. Without recording that, the console check below
+        # would flag the deliberate 400 as a defect and hide real ones behind it.
+        expected_bad_request = True
+
+        body = page.inner_text("body")
+        # The failure banner reads "Carinaa stopped before producing an answer"
+        # followed by the backend's own message (which for a paginated document is
+        # "page 9999 does not exist", and for a Markdown fixture is the
+        # no-page-metadata explanation). Match the banner, not one specific cause.
+        check(
+            "the failure is shown",
+            "stopped before producing an answer" in body
+            or "could not be answered" in body.lower(),
+        )
+        # The critical assertion: no completed pipeline next to a failed run.
+        # "recovered"/stage checkmarks would mean the panel is lying.
+        check(
+            "the panel does NOT claim the pipeline completed",
+            "Carinaa stopped before producing an answer" in body,
+        )
+
         # ---- 7b. The conversational labs render -----------------------
         print("\n7b. The three conversational labs render")
         for slug, marker in (
@@ -309,10 +417,16 @@ def main() -> int:
 
     # ---- console + network summary ------------------------------------
     print("\n9. Console and network health")
+    unexpected = [
+        entry
+        for entry in console_errors
+        # A deliberate 4xx is a fixture, not a defect.
+        if not (expected_bad_request and "status of 4" in entry)
+    ]
     check(
-        "no console errors across the whole run",
-        not console_errors,
-        console_errors[0][:200] if console_errors else f"{len(console_errors)} errors",
+        "no unexpected console errors across the whole run",
+        not unexpected,
+        unexpected[0][:200] if unexpected else f"{len(console_errors)} total, all expected",
     )
     # Favicon 404s are not meaningful.
     meaningful = [r for r in failed_requests if "favicon" not in r]

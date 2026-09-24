@@ -136,3 +136,34 @@ def expand_unit_reference(question: str) -> tuple[str, str]:
 
     expanded = f"{question} (UNIT {roman})"
     return expanded, f'"{phrase}" resolved to "UNIT {roman}" and added to the search'
+
+
+def _normalise(value: str) -> str:
+    """Collapse punctuation and spacing, so 'UNIT – III' and 'UNIT III' compare equal.
+
+    Real headings use en dashes, extra spaces and inconsistent casing. Comparing raw
+    strings would only match the tidiest documents.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def match_unit_section(question: str, sections: list[str]) -> str | None:
+    """The section whose heading names the unit the question asks about.
+
+    This is the FIX that the lexical blend only approximated. The blend nudges scores;
+    an index filter removes every chunk that is not in the right unit, which is what
+    "don't return unrelated chunks" actually requires.
+
+    Returns the exact stored section title, because that is what the metadata filter
+    needs. Returns None when no heading names that unit - the caller then falls back to
+    scoring, rather than filtering to nothing and losing the answer entirely.
+    """
+    _number, roman, _phrase = detect_unit_reference(question)
+    if not roman:
+        return None
+
+    target = _normalise(f"UNIT {roman}")
+    for section in sections:
+        if target and target in _normalise(section):
+            return section
+    return None

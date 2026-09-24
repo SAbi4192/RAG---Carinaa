@@ -409,3 +409,36 @@ Everything else is supporting material.
 ## Back to the beginning
 
 ← [Documentation index](README.md)
+
+---
+
+## Click-through order for the demo (3 minutes)
+
+1. **Chat → ask a normal question.**
+   *"What does UNIT III say?"*
+   Point out: the provider badge says **Gemini**, role *primary*. It used the configured model directly.
+
+2. **Open Sources.** Show the citation resolves to a real location
+   (`UNIT III – Concept Generation`). Click the citation → it scrolls to the source card.
+
+3. **Open Retrieval Details.** Show the measured numbers: candidates, excerpts, top score, scope.
+
+4. **Ask a page question:** *"Tell me what is on page number 3."*
+   Point out: page filter applied → only chunks covering page 3 were searched.
+
+5. **Test memory:** *"My name is Abishek." then "What is my name?"*
+   Answer: *"Your name is Abishek."* — from the conversation, not the documents.
+
+6. **Toggle Learning Mode.** Ask another question. The panel opens itself and steps through
+   the stages; the answer appears after the walkthrough reaches generation.
+
+7. **Show the fallback (if Gemini is rate limited):** the provider reads *Groq · Fallback*,
+   and the trace shows which Gemini models were skipped and why.
+
+### What to say about the hybrid
+
+> Gemini and Groq each have a chain of models. Rate limits apply per model, so if one is
+> busy we try the next. Whichever model answered is recorded in the trace, so you always
+> know which model wrote the answer. Gemini is primary; Groq takes over only when Gemini
+> cannot serve the request.
+

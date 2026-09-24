@@ -159,6 +159,24 @@ class Settings(BaseSettings):
     # Verified against https://ai.google.dev/gemini-api/docs/models (Stable/GA).
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+
+    # MODEL CHAIN. Gemini rate-limits per model, so a 429 on one model often
+    # leaves the others usable. Trying the next one turns "the provider is down"
+    # into "that model is busy". Ordered best-quality first, then lighter
+    # variants that carry larger quotas.
+    #
+    # `gemini_model` stays FIRST so an explicit user choice is respected; the rest
+    # are automatic alternates. Set GEMINI_MODELS to a single ID to disable
+    # chaining.
+    gemini_models: str = (
+        "gemini-2.5-flash,"
+        "gemini-3.5-flash,"
+        "gemini-2.5-flash-lite,"
+        "gemini-3.6-flash,"
+        "gemini-3.7-flash,"
+        "gemini-3.8-flash,"
+        "gemini-flash-latest"
+    )
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_temperature: float = 0.2
     gemini_max_output_tokens: int = 2048
@@ -191,6 +209,15 @@ class Settings(BaseSettings):
     # Verified against https://console.groq.com/docs/models (Production).
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
+
+    # MODEL CHAIN, same rationale as Gemini: a 429 hits one model at a time.
+    groq_models: str = (
+        "openai/gpt-oss-120b,"
+        "groq/compound,"
+        "openai/gpt-oss-20b,"
+        "qwen/qwen3.8-27b,"
+        "groq/compound-mini"
+    )
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_temperature: float = 0.2
     groq_max_output_tokens: int = 2048
@@ -333,14 +360,14 @@ class Settings(BaseSettings):
                 "offline_extractive_failsafe": self.offline_extractive_failsafe,
             },
             "providers": {
-                "gemini": {
-                    "configured": self.gemini_configured,
-                    "model": self.gemini_model,
-                    "role": "primary",
-                },
                 "groq": {
                     "configured": self.groq_configured,
                     "model": self.groq_model,
+                    "role": "primary",
+                },
+                "gemini": {
+                    "configured": self.gemini_configured,
+                    "model": self.gemini_model,
                     "role": "fallback",
                 },
                 "local": {

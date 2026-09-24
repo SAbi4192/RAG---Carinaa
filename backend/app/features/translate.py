@@ -47,7 +47,13 @@ from app.core.config import settings
 from app.core.errors import TranslationError, TranslationUnavailableOffline
 from app.core.logging import get_logger
 from app.db.models import AnswerVariant, Message
-from app.features.languages import get_language, is_supported, translation_token_budget
+from app.features.languages import (
+    as_list,
+    get_language,
+    is_supported,
+    translation_hint,
+    translation_token_budget,
+)
 from app.features.validation import validate_translation
 from app.llm.adapter import get_llm_adapter
 from app.llm.base import LLMError
@@ -82,7 +88,7 @@ async def translate_answer(
     if not is_supported(code):
         raise TranslationError(
             f"'{target_language}' is not a supported language.",
-            detail={"supported": ["en", "ta", "ml", "te", "hi", "ja", "it"]},
+            detail={"supported": [lang["code"] for lang in as_list()]},
         )
 
     # English is the canonical language; asking for it is a no-op.
@@ -135,7 +141,10 @@ async def translate_answer(
     try:
         response = await adapter.generate(
             build_translation_messages(
-                message.content, code, target_language_name=language.name
+                message.content,
+                code,
+                target_language_name=language.name,
+                extra_hint=translation_hint(code),
             ),
             mode=mode,
             # Translation wants determinism, not creativity.
@@ -183,6 +192,7 @@ async def translate_answer(
                     code,
                     target_language_name=language.name,
                     correction=validation.missing_citations,
+                    extra_hint=translation_hint(code),
                 ),
                 mode=mode,
                 temperature=0.0,
@@ -252,5 +262,114 @@ async def translate_answer(
         model=response.model,
         cached=False,
         validation=validation.as_dict(),
+        warning=warning,
+    )
+
+
+@dataclass
+class TextTranslationOutcome:
+    content: str
+    language: str
+    provider: str
+    model: str
+    warning: str = ""
+
+
+async def translate_text(
+    *,
+    text: str,
+    target_language: str,
+    mode: str,
+) -> TextTranslationOutcome:
+    """Translate free text - the Learning Mode explanation.
+
+    WHY THIS IS SEPARATE FROM `translate_answer`
+    --------------------------------------------
+    `translate_answer` is bound to a stored answer: it validates citation markers,
+    caches an `AnswerVariant` row and refuses to touch `Message.content`. The
+    Learning panel needs the opposite: translate prose that is not an answer, keep
+    nothing, and never make the result look like a variant of the answer.
+
+    Two rules are deliberately shared with the answer path, because they are product
+    guarantees rather than implementation details:
+
+      * Offline mode never reaches for an online translator. If the local model is
+        unavailable, it refuses with a clear message.
+      * The text handed in is never modified; the caller keeps the original and shows
+        the translation beside it.
+
+    The Tanglish hint is applied for the same reason as in the answer path: `ta-ta`
+    is a script decision (Tamil words in Roman letters), not a vocabulary one, and a
+    model left to itself drifts into either English or Tamil script.
+    """
+    if not settings.translation_enabled:
+        raise TranslationError("Translation is disabled on this server.")
+
+    source = (text or "").strip()
+    if not source:
+        raise TranslationError("There is nothing to translate.")
+
+    code = (target_language or "en").strip().lower()
+    if not is_supported(code):
+        raise TranslationError(
+            f"'{target_language}' is not a supported language.",
+            detail={"supported": [lang["code"] for lang in as_list()]},
+        )
+
+    if code == "en":
+        return TextTranslationOutcome(
+            content=source, language="en", provider="none", model=""
+        )
+
+    if len(source) > settings.max_translate_chars:
+        raise TranslationError(
+            f"This text is too long to translate in one pass "
+            f"({len(source)} characters; limit is {settings.max_translate_chars})."
+        )
+
+    language = get_language(code)
+    adapter = get_llm_adapter()
+    budget = translation_token_budget(source, code)
+
+    try:
+        response = await adapter.generate(
+            build_translation_messages(
+                source,
+                code,
+                target_language_name=language.name,
+                extra_hint=translation_hint(code),
+            ),
+            mode=mode,
+            temperature=0.0,
+            max_tokens=budget,
+        )
+    except LLMError as exc:
+        if mode == "offline":
+            raise TranslationUnavailableOffline(
+                "Translation is unavailable in Offline mode because the local model "
+                "could not be used."
+            ) from exc
+        raise TranslationError(
+            "The translation could not be generated.",
+            detail={"reason": exc.__class__.__name__},
+        ) from exc
+
+    translated = response.text.strip()
+    if not translated:
+        raise TranslationError("The translation came back empty.")
+
+    warning = ""
+    if response.truncated:
+        warning = (
+            "The provider stopped generating before it finished, so this translation "
+            "may be incomplete."
+        )
+        logger.warning("Learning-panel translation was truncated by the output limit.")
+
+    return TextTranslationOutcome(
+        content=translated,
+        language=code,
+        provider=response.provider,
+        model=response.model,
         warning=warning,
     )

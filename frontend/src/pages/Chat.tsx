@@ -11,7 +11,6 @@ import {
   MessagesSquare,
   Minimize2,
   Paperclip,
-  Plus,
   Settings2,
   Sparkles,
   Trash2,
@@ -44,6 +43,7 @@ import { Segmented } from "@/components/ui/Tabs";
 import { Input, Select, Textarea, Toggle } from "@/components/ui/Field";
 import { EmptyState, ErrorState, LoadingPanel, Spinner } from "@/components/ui/Feedback";
 import { ChatDocuments } from "@/components/chat/ChatDocuments";
+import { ThinkingStages } from "@/components/chat/ThinkingStages";
 import { MessageBubble } from "@/components/chat/MessageBubble";
 import { UploadDialog } from "@/components/documents/UploadDialog";
 import { LearningPanel } from "@/components/rag/LearningPanel";
@@ -70,6 +70,17 @@ const EXAMPLE_QUESTIONS = [
   "What limitations or warnings do the documents mention?",
   "List the definitions given for the important terms.",
 ];
+
+/**
+ * Whether the visitor asked their system to reduce motion.
+ *
+ * Used by the guided scroll: with reduce-motion on, the thread JUMPS to the
+ * inspected pair instead of gliding - same information, no vestibular cost.
+ */
+function prefersReducedMotionSafe(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+}
 
 /**
  * Chat.
@@ -117,6 +128,17 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     detail: Record<string, unknown>;
   } | null>(null);
 
+  /**
+   * Whether the MOST RECENT run failed.
+   *
+   * The panel must never present a completed pipeline when there is no answer, so the
+   * run outcome is tracked explicitly rather than inferred from the presence of a
+   * trace. A trace alone is not proof of success - it may belong to an earlier,
+   * successful run, which is precisely how the panel came to show checkmarks while the
+   * chat showed an error.
+   */
+  const [runFailed, setRunFailed] = useState(false);
+
   // Retrieval overrides
   const [mode, setMode] = useState<"online" | "offline">("online");
   const [showOptions, setShowOptions] = useState(false);
@@ -126,6 +148,16 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
   const [useWeb, setUseWeb] = useState(false);
 
   const [traceFor, setTraceFor] = useState<number | null>(null);
+
+  /**
+   * The assistant message the Learning panel is currently explaining.
+   *
+   * Learning Mode is per-message: clicking any answer loads THAT answer's trace,
+   * question, scope and diagram. Null means "follow the newest answer"; asking a
+   * new question in Learning Mode resets to null so the panel always explains the
+   * run the user just watched, never a stale one.
+   */
+  const [selectedMessageId, setSelectedMessageId] = useState<number | null>(null);
 
   /**
    * The trace for each answer, captured from the ask response.
@@ -150,6 +182,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
             total_ms: trace.total_ms,
             stages: trace.stages,
             summary: trace.summary ?? {},
+            question: trace.question ?? "",
           },
         }));
       } catch {
@@ -168,15 +201,63 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     return null;
   }, [messages]);
 
-  const latestTrace = lastAssistantId ? traces[lastAssistantId] ?? null : null;
+  /** The message the panel explains right now: an explicit pick, else the newest. */
+  const inspectedMessageId = selectedMessageId ?? lastAssistantId;
+
+  /**
+   * The question that produced the inspected answer. Prefer the captured ask
+   * response; fall back to the question the trace endpoint resolved, then to the
+   * user turn immediately above the answer in loaded history.
+   */
+  const inspectedQuestion = useMemo(() => {
+    if (inspectedMessageId == null) return "";
+    const fromTrace = traces[inspectedMessageId]?.question;
+    if (fromTrace) return fromTrace;
+    const answerIndex = messages.findIndex((m) => m.id === inspectedMessageId);
+    for (let index = answerIndex - 1; index >= 0; index -= 1) {
+      if (messages[index].role === "user") return messages[index].content;
+    }
+    return "";
+  }, [inspectedMessageId, traces, messages]);
+
+  /**
+   * The question the inspected answer is replying to. For the newest answer this is
+   * simply the last user message; for an older selection, it is the user turn that
+   * precedes the chosen assistant message.
+   */
+  const latestTrace = inspectedMessageId ? traces[inspectedMessageId] ?? null : null;
 
   // Learning Mode needs the trace even for a conversation loaded from history,
-  // where no ask response is in memory. Fetched once, on demand.
+  // where no ask response is in memory. Fetched once, on demand - including for
+  // whichever older answer the user clicks.
   useEffect(() => {
-    if (learning && lastAssistantId) void ensureTrace(lastAssistantId);
+    if (learning && inspectedMessageId) void ensureTrace(inspectedMessageId);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- ensureTrace changes identity
     // whenever `traces` does; including it would re-run on every trace write.
-  }, [learning, lastAssistantId]);
+  }, [learning, inspectedMessageId]);
+
+  /** Inspectable answers for the panel's message picker: id + question + snippet. */
+  const learnableMessages = useMemo(() => {
+    const items: { messageId: number; question: string; answer: string }[] = [];
+    for (const message of messages) {
+      if (message.role !== "assistant" || message.id <= 0) continue;
+      // The nearest preceding user turn is this answer's question when the trace
+      // does not carry one (older rows, or ask-response traces without a question).
+      let pairedQuestion = traces[message.id]?.question ?? "";
+      if (!pairedQuestion) {
+        const idx = messages.findIndex((m) => m.id === message.id);
+        for (let i = idx - 1; i >= 0 && !pairedQuestion; i -= 1) {
+          if (messages[i].role === "user") pairedQuestion = messages[i].content;
+        }
+      }
+      items.push({
+        messageId: message.id,
+        question: pairedQuestion,
+        answer: (message.content || "").slice(0, 140),
+      });
+    }
+    return items;
+  }, [messages, traces]);
 
   const [pendingDelete, setPendingDelete] = useState<Conversation | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -379,6 +460,56 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     [conversationId, toast],
   );
 
+  const handleClearScope = useCallback(async () => {
+    if (!conversationId || !scope) return;
+    setScopeBusy(true);
+    try {
+      // Detaching them all is what returning to workspace scope means, and the
+      // server says an empty chat scope IS workspace scope - so no special
+      // endpoint is needed, just the existing one, repeatedly.
+      let next = scope;
+      for (const item of scope.documents) {
+        next = await api.chat.detachDocument(conversationId, item.document_id);
+      }
+      setScope(next);
+      toast.success("Scope cleared", "This chat will search the whole workspace again.");
+    } catch {
+      toast.error("Could not clear the scope", "Try again in a moment.");
+    } finally {
+      setScopeBusy(false);
+    }
+  }, [conversationId, scope, toast]);
+
+  /**
+   * "Want to explore beyond your documents?" — the opt-in web affordance.
+   *
+   * This never sends a web request itself. It arms web search for the NEXT
+   * question, prefills the question that produced the current answer, and says
+   * exactly what will happen - so the user stays in control of when the web is
+   * searched, and the document-first conversation is never hijacked.
+   */
+  const handleExploreWeb = useCallback(
+    (messageId: number) => {
+      if (mode !== "online") return;
+      const index = messages.findIndex((item) => item.id === messageId);
+      let original = "";
+      for (let i = index - 1; i >= 0; i -= 1) {
+        if (messages[i].role === "user") {
+          original = messages[i].content;
+          break;
+        }
+      }
+      if (!original) return;
+      setUseWeb(true);
+      setQuestion(original);
+      toast.info(
+        "🌐 Web search is on",
+        "Your question is ready — press Enter to ask again with web results included.",
+      );
+    },
+    [messages, mode, toast],
+  );
+
   const openUpload = useCallback((file: File | null = null) => {
     setDroppedFile(file);
     setUploadOpen(true);
@@ -486,13 +617,102 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
 
-  /* ---- auto-scroll on new content ------------------------------------ */
-  useEffect(() => {
-    if (!messages.length) return;
+  /* ---- scroll management (§10) ----------------------------------------
+     Two rules, both from real behaviour:
+
+     1. A newly SENT question is anchored to the TOP of the thread, so the
+        answer appears below it and is read from its beginning - the user
+        never has to scroll up to find where the answer started.
+     2. The thread is only auto-scrolled to the bottom while the user is
+        ALREADY near the bottom (loading a history, or following an answer
+        as it lands). Scrolling up to re-read older messages must never be
+        fought by the auto-scroller, so a manual scroll-up disables following
+        until the user scrolls back down. */
+  const nearBottomRef = useRef(true);
+  const anchorQuestionRef = useRef<number | null>(null);
+
+  const handleThreadScroll = useCallback(() => {
     const element = threadRef.current;
-    if (!element) return;
-    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    if (element) {
+      nearBottomRef.current =
+        element.scrollHeight - element.scrollTop - element.clientHeight < 160;
+    }
+  }, []);
+
+  useEffect(() => {
+    const element = threadRef.current;
+    if (!element || !messages.length) return;
+
+    if (anchorQuestionRef.current != null) {
+      const node = element.querySelector<HTMLElement>(
+        `[data-question="${anchorQuestionRef.current}"]`,
+      );
+      if (node) {
+        // Rect-relative, not offsetTop: the thread's children do not all share
+        // one offsetParent, and offsetTop would anchor to the wrong line.
+        const delta =
+          node.getBoundingClientRect().top - element.getBoundingClientRect().top;
+        element.scrollTop += delta - 12;
+        anchorQuestionRef.current = null;
+        nearBottomRef.current = false;
+        return;
+      }
+    }
+
+    // Follow the bottom only when already there (history load, or while an
+    // answer lands). Otherwise leave the user's position untouched.
+    if (nearBottomRef.current) {
+      element.scrollTop = element.scrollHeight;
+    }
   }, [messages.length, asking]);
+
+  /* ---- guided repositioning for Learning Mode (one shot, never continuous)
+     Entering Learning Mode - or picking a different answer - smoothly brings the
+     pair (question → answer) into view ONCE, so the right-hand panel clearly
+     belongs to what is on screen. Two rules keep it polite:
+
+       1. It only fires when the pair is actually out of comfortable view.
+          If the reader is already looking at it, nothing moves.
+       2. It never fires twice for the same target, and never while an answer
+          is being generated - after the one move, the user owns the scroll. */
+  const guidedScrollKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!learning || asking) return;
+    if (inspectedMessageId == null) return;
+
+    const key = `${conversationId ?? "new"}:${inspectedMessageId}`;
+    if (guidedScrollKeyRef.current === key) return;
+    guidedScrollKeyRef.current = key;
+
+    // The anchor is the USER turn that precedes the inspected answer - the pair
+    // reads top-to-bottom as question → answer → the panel on the right.
+    const answerIndex = messages.findIndex((item) => item.id === inspectedMessageId);
+    let anchorId: number | null = null;
+    for (let i = answerIndex; i >= 0; i -= 1) {
+      if (messages[i]?.role === "user" && messages[i].id > 0) {
+        anchorId = messages[i].id;
+        break;
+      }
+    }
+    if (anchorId == null) return;
+
+    const timer = window.setTimeout(() => {
+      const element = threadRef.current;
+      const node = element?.querySelector<HTMLElement>(`[data-question="${anchorId}"]`);
+      if (!element || !node) return;
+      const delta = node.getBoundingClientRect().top - element.getBoundingClientRect().top;
+      const comfortable =
+        delta >= 0 && delta <= Math.max(120, element.clientHeight * 0.55);
+      if (comfortable) return;
+      element.scrollTo({
+        top: element.scrollTop + delta - 24,
+        behavior: prefersReducedMotionSafe() ? "auto" : "smooth",
+      });
+    }, 180);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- re-arms only when the inspected answer or conversation changes
+  }, [learning, asking, conversationId, inspectedMessageId, messages]);
 
   /* ---- ask ----------------------------------------------------------- */
   const ask = useCallback(
@@ -502,7 +722,11 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
 
       setAsking(true);
       setAskError(null);
+      setRunFailed(false);
       setQuestion("");
+      // A fresh question means the panel should explain the NEW run, not whatever
+      // older answer was previously selected.
+      setSelectedMessageId(null);
 
       // Show the user's turn immediately. This is an optimistic render of text
       // the user definitely typed, not a fabricated answer - the assistant's
@@ -529,6 +753,9 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
         created_at: new Date().toISOString(),
       };
       setMessages((current) => [...current, optimistic]);
+      // Anchor the thread at this question when it renders (§10): the answer
+      // then reads from its beginning, and no manual scroll-up is needed.
+      anchorQuestionRef.current = optimistic.id;
 
       try {
         const result: AskResponse = await api.chat.ask({
@@ -550,7 +777,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
         ]);
 
         setGroundings((current) => ({ ...current, [result.message.id]: result.grounding }));
-        setTraces((current) => ({ ...current, [result.message.id]: result.trace }));
+        setTraces((current) => ({
+          ...current,
+          [result.message.id]: { ...result.trace, question: result.trace.question || trimmed },
+        }));
 
         if (!conversationId) {
           setConversationId(result.conversation_id);
@@ -588,6 +818,17 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
 
         const message =
           cause instanceof ApiError ? cause.message : "The question could not be answered.";
+
+        setRunFailed(true);
+        // Drop the trace for the turn that failed. Without this, the panel falls back
+        // to the previous successful run and shows a fully completed pipeline next to
+        // an error - the exact failure the brief describes.
+        setTraces((current) => {
+          const next = { ...current };
+          delete next[optimistic.id - 1];
+          delete next[optimistic.id];
+          return next;
+        });
 
         if (cause instanceof ApiError) {
           setAskError({
@@ -861,7 +1102,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                     value: "online",
                     label: "Online",
                     icon: <Wifi className="h-3 w-3" />,
-                    title: "Gemini first, Groq as a disclosed fallback",
+                    title: "Groq first, Gemini as a disclosed fallback",
                   },
                   {
                     value: "offline",
@@ -954,20 +1195,20 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 learning && pipelineMode === "full" && "hidden",
               )}
             >
-            <div ref={threadRef} className="flex-1 overflow-y-auto scrollbar-thin px-4 py-5 sm:px-7">
+            <div ref={threadRef} onScroll={handleThreadScroll} className="flex-1 overflow-y-auto scrollbar-thin px-4 py-5 sm:px-7">
               <div className="mx-auto max-w-3xl space-y-5">
                 {messages.length === 0 ? (
                   <div className="pt-6">
                     <EmptyState
                       icon={<Sparkles className="h-5 w-5" />}
-                      title="Ask something about your documents"
+                      title="Ask Carinaa anything"
                       description={
                         active?.stats?.documents
-                          ? `${pluralize(active.stats.documents, "document")} and ${pluralize(
-                              active.stats.chunks,
-                              "chunk",
-                            )} are searchable in this workspace. Answers will cite the passages they came from.`
-                          : "This workspace has no documents yet, so there is nothing to retrieve. Add a file first."
+                          ? `Carinaa answers using your documents: it finds the relevant passages in this workspace (${pluralize(
+                              active.stats.documents,
+                              "document",
+                            )}), answers from them, and can show you the sources. Just type a question below.`
+                          : "Carinaa answers using your documents. This workspace has none yet — add a file with the 📎 button below, then ask about it."
                       }
                     />
 
@@ -1013,21 +1254,33 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                         setVariants((current) => ({ ...current, [message.id]: variant }))
                       }
                       onOpenTrace={() => setTraceFor(message.id)}
+                      onSelectForLearning={
+                        learning && message.role === "assistant" && message.id > 0
+                          ? () => setSelectedMessageId(message.id)
+                          : undefined
+                      }
+                      isSelectedForLearning={learning && message.id === inspectedMessageId}
+                      onExploreWeb={
+                        message.role === "assistant" &&
+                        message.id > 0 &&
+                        !message.web_search_used &&
+                        mode === "online"
+                          ? () => handleExploreWeb(message.id)
+                          : undefined
+                      }
+                      threadAnchor={message.role === "user" ? message.id : undefined}
                     />
                     )
                   ))
                 )}
 
                 {asking ? (
-                  <div className="flex items-center gap-3 text-xs text-muted">
-                    <Spinner size={14} />
-                    <span>
-                      Retrieving and generating…
-                      {mode === "offline"
-                        ? " The local model can take 30 seconds or more on a laptop."
-                        : ""}
-                    </span>
-                  </div>
+                  /* The stage names only cycle in Learning Mode. On the normal Chat
+                     screen this is a plain waiting line. */
+                  <ThinkingStages
+                    offline={mode === "offline"}
+                    animate={learning}
+                  />
                 ) : null}
 
                 {askError ? (
@@ -1091,6 +1344,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                     onAttach={handleAttach}
                     onToggle={handleToggleDocument}
                     onDetach={handleDetachDocument}
+                    onClearScope={scope && scope.documents.length > 0 ? handleClearScope : undefined}
                     busy={scopeBusy}
                   />
                 ) : null}
@@ -1129,11 +1383,11 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                         checked={useWeb}
                         onChange={setUseWeb}
                         disabled={mode === "offline"}
-                        label="Augment with web search"
+                        label="🌐 Search the web for more detail (optional)"
                         hint={
                           mode === "offline"
                             ? "Unavailable in offline mode - web search would require the network."
-                            : "Off by default. Results are labelled separately from your documents."
+                            : "Off by default. Searches current web information IN ADDITION to your selected knowledge, and labels every web source 🌐 so you can tell the two apart."
                         }
                       />
                     </div>
@@ -1152,7 +1406,27 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                   </div>
                 ) : null}
 
-                <div className="flex items-end gap-2">
+                {/* Web search is OPT-IN. When it is armed, say so exactly where the
+                    question is typed - one clear line, not a permanent toggle
+                    competing with the input for attention. */}
+                {useWeb && mode === "online" ? (
+                  <div className="flex animate-fade-up items-start gap-2 rounded-lg border border-brand/30 bg-brand/6 px-3 py-2">
+                    <Globe className="mt-px h-3.5 w-3.5 shrink-0 text-brand" />
+                    <p className="min-w-0 flex-1 text-2xs leading-relaxed text-muted">
+                      🌐 Web search is on for your next question. Your documents are still
+                      searched first — the web is added alongside them and clearly labelled.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setUseWeb(false)}
+                      className="shrink-0 text-2xs text-faint underline decoration-dotted underline-offset-2 transition hover:text-ink"
+                    >
+                      turn off
+                    </button>
+                  </div>
+                ) : null}
+
+                <div className="flex items-end gap-1 rounded-2xl border border-line-strong bg-surface p-1.5 shadow-card transition-colors duration-150 focus-within:border-brand focus-within:ring-2 focus-within:ring-brand/30">
                   <Button
                     variant="ghost"
                     size="icon"
@@ -1160,11 +1434,12 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                     aria-label="Add a document"
                     title="Add a document to this workspace"
                     disabled={!activeId}
+                    className="shrink-0"
                   >
-                    <Plus className="h-4 w-4" />
+                    <Paperclip className="h-4 w-4" />
                   </Button>
 
-                  <div className="relative flex-1">
+                  <div className="relative min-w-0 flex-1">
                     <Textarea
                       value={question}
                       onChange={(event) => setQuestion(event.target.value)}
@@ -1176,12 +1451,13 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                       }}
                       placeholder={
                         active?.stats?.documents
-                          ? "Ask a question about your documents…"
-                          : "Add a document first, then ask about it…"
+                          ? "Ask Carinaa..."
+                          : "Add a document first, then ask about it..."
                       }
                       rows={1}
                       disabled={!active?.stats?.documents}
-                      className="min-h-[2.5rem] resize-none pr-2"
+                      aria-label="Ask Carinaa"
+                      className="min-h-[2.25rem] resize-none border-0 bg-transparent px-1.5 py-1.5 shadow-none focus:border-0 focus:ring-0"
                     />
                   </div>
 
@@ -1234,6 +1510,13 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 running={asking}
                 onClose={() => setPipelineMode("hidden")}
                 onPlayingChange={setPipelinePlaying}
+                failed={runFailed}
+                failureMessage={askError?.message}
+                question={inspectedQuestion}
+                selectedMessageId={inspectedMessageId}
+                allAnswers={learnableMessages}
+                onSelectAnswer={(id) => setSelectedMessageId(id)}
+                languages={languageList}
               />
             </aside>
           ) : null}
@@ -1263,6 +1546,13 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                   running={asking}
                   onClose={() => setPipelineMode("side")}
                   onPlayingChange={setPipelinePlaying}
+                  failed={runFailed}
+                  failureMessage={askError?.message}
+                  question={inspectedQuestion}
+                  selectedMessageId={inspectedMessageId}
+                  allAnswers={learnableMessages}
+                  onSelectAnswer={(id) => setSelectedMessageId(id)}
+                  languages={languageList}
                 />
               </div>
             </div>
@@ -1336,6 +1626,11 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
               totalMs={latestTrace?.total_ms}
               running={asking}
               onClose={() => setShowPipelineDrawer(false)}
+              question={inspectedQuestion}
+              selectedMessageId={inspectedMessageId}
+              allAnswers={learnableMessages}
+              onSelectAnswer={(id) => setSelectedMessageId(id)}
+              languages={languageList}
             />
           </div>
         </div>

@@ -24,8 +24,16 @@ transformed version.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+from dataclasses import dataclass
+from typing import Any, AsyncIterator
+
 from fastapi import APIRouter, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.deps import CurrentUser, DbSession
@@ -40,11 +48,13 @@ from app.db.models import (
     Message,
     QueryLog,
     TraceEvent,
+    User,
     Workspace,
     utcnow,
 )
-from app.rag.pipeline import get_rag_pipeline, retrieve_only
+from app.rag.pipeline import RAGAnswer, get_rag_pipeline, retrieve_only
 from app.rag.sections import detect_relative_section, match_section
+from app.rag.units import match_unit_section
 from app.rag.references import (
     needs_document_clarification,
     resolve_relative_page,
@@ -248,6 +258,54 @@ def _require_message(db: DbSession, user: CurrentUser, message_id: int) -> Messa
     return message
 
 
+def _question_for(db: DbSession, message: Message) -> str:
+    """The user turn that this assistant answer belongs to.
+
+    Learning Mode is per-message: the panel must show the question that produced the
+    answer being inspected, and everything below it must belong to that same turn.
+    An assistant row stores no question, so it is resolved here - the nearest user
+    message at or before this one, in the same conversation.
+    """
+    previous = db.scalars(
+        select(Message)
+        .where(
+            Message.conversation_id == message.conversation_id,
+            Message.role == "user",
+            Message.id <= message.id,
+        )
+        .order_by(Message.id.desc())
+        .limit(1)
+    ).first()
+    return (previous.content or "") if previous else ""
+
+
+def _persist_trace(
+    db: DbSession, *, message_id: int, trace: TraceRecorder
+) -> None:
+    """Write one TraceEvent row per stage against a message.
+
+    `created_at` is passed explicitly rather than left to the column default. The
+    default fires at INSERT time, which is AFTER the work finished, so without this
+    every event would be stamped with the same second - making the timestamped trace
+    useless and, worse, misleading: it would imply the whole pipeline ran
+    instantaneously.
+    """
+    for event in trace.events:
+        db.add(
+            TraceEvent(
+                message_id=message_id,
+                trace_id=trace.trace_id,
+                seq=event.seq,
+                stage=event.stage,
+                status=event.status,
+                duration_ms=event.duration_ms,
+                event_data={**event.data, "label": event.label},
+                created_at=event.created_at or utcnow(),
+            )
+        )
+    db.commit()
+
+
 def _resolve_mode(user: CurrentUser, requested: str | None) -> str:
     """Decide the AI mode. Server-side default wins over a missing request value."""
     if requested in ("online", "offline"):
@@ -377,11 +435,50 @@ def delete_conversation(conversation_id: int, user: CurrentUser, db: DbSession) 
 
 
 # ---------------------------------------------------------------------------
-# Ask
+# Ask - shared preparation
 # ---------------------------------------------------------------------------
-@router.post("/chat/ask", response_model=AskResponse)
-async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskResponse:
-    """Ask a question and get a grounded, cited answer."""
+# `/chat/ask` and `/chat/ask/stream` must never disagree about what happened for a
+# question: the same validation, the same conversation handling, the same web
+# search, the same scope, the same page/section resolution, the same persistence,
+# the same response payload. The only thing that differs is whether the model's
+# output is buffered or streamed.
+#
+# So everything except the "buffer a whole generation" step lives in shared
+# helpers below. Both endpoints call them, which is what makes the agreement a
+# structural fact rather than a convention.
+@dataclass
+class _AskContext:
+    """Everything the pipeline and the persistence layer need, resolved once."""
+
+    workspace: Workspace
+    conversation: Conversation
+    user_message: Message
+    mode: str
+    question: str
+    trace: TraceRecorder
+    web_sources: list[dict]
+    resolved_scope: list[int] | None
+    workspace_ready: int
+    scope_names: list[str]
+    requested_page: int | None
+    page_phrase: str
+    relative_note: str
+    section_match: str | None
+    section_is_relative: str | None
+    conversation_history: list[dict[str, str]]
+
+
+def _prepare_ask(
+    db: Session, user: User, payload: AskRequest
+) -> _AskContext:
+    """Validate, create the conversation + user row, search the web if asked,
+    resolve the retrieval scope, and detect page/section/unit references.
+
+    Nothing here streams. Raises `CarinaaError` for every honest refusal -
+    ambiguous references, pages that do not exist, workspaces the user does not
+    own. Because that behaviour is shared with `/chat/ask`, the two endpoints
+    cannot drift on what counts as a valid question.
+    """
     workspace = _require_workspace(db, user, payload.workspace_id)
     mode = _resolve_mode(user, payload.mode)
 
@@ -443,22 +540,12 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
             trace.skip("web_search", reason)
 
     # ---- resolve the retrieval scope --------------------------------------
-    # Resolved once and reused, so the scope that is APPLIED and the scope that is
-    # REPORTED cannot drift apart.
     resolved_scope = _resolve_retrieval_scope(db, conversation.id, payload.document_ids)
 
     # ---- understand the question ------------------------------------------
-    # A page reference is a STRUCTURAL constraint. Dense retrieval compares meaning,
-    # and "the second page" means nothing to it, so the constraint is applied as a
-    # filter rather than hoped for in the ranking.
     requested_page, page_phrase, page_is_relative, page_direction = detect_page_reference(
         payload.question
     )
-
-    # A relative reference ("the next page") can only be resolved from what the
-    # conversation established. When nothing established a page, it stays
-    # unresolved rather than being guessed - and the question is answered as a
-    # normal question instead.
     relative_note = ""
     if page_is_relative:
         resolved_page, relative_source = resolve_relative_page(
@@ -469,9 +556,6 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
             relative_note = f"Resolved from {relative_source}."
             page_is_relative = False
 
-    # Several documents in scope and none named makes "page 2" unanswerable.
-    # Asking is better than picking one, because a confident answer from the wrong
-    # document is worse than a clarifying question.
     scope_names = _scope_filenames(db, resolved_scope, workspace.id)
     ambiguous = needs_document_clarification(payload.question, requested_page, scope_names)
     if ambiguous is not None:
@@ -488,10 +572,6 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         span = _page_range(db, resolved_scope, workspace.id)
 
         if span is None:
-            # No page metadata anywhere in scope. That is different from a page
-            # being out of range: the document has no pages at all. Reporting
-            # "could not find it" here would imply the content is missing, when
-            # actually the question does not apply to this file type.
             raise CarinaaError(
                 "The documents in scope have no page information, so a page number "
                 "does not apply. This happens with plain text, Markdown and CSV "
@@ -502,10 +582,6 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
             )
 
         if not (span[0] <= requested_page <= span[1]):
-            # Confirmed by real metadata, so say so plainly instead of running a
-            # search that cannot succeed and letting the model invent something.
-            # 400 with a precise message: the page range is real metadata, so this
-            # is a confident statement rather than a guess.
             raise CarinaaError(
                 f"The documents in scope have pages {span[0]} to {span[1]}, so "
                 f"page {requested_page} does not exist.",
@@ -517,36 +593,18 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
                 },
             )
 
-    # A section is a NAME, so matching runs against the titles actually indexed rather
-    # than being parsed out of the question. A question that names no real section
-    # falls through to ordinary retrieval.
-    section_match = match_section(payload.question, _scope_sections(db, resolved_scope, workspace.id))
+    available_sections = _scope_sections(db, resolved_scope, workspace.id)
+    section_match = match_section(payload.question, available_sections)
+
+    unit_section = None
+    if section_match is None:
+        unit_section = match_unit_section(payload.question, available_sections)
+        if unit_section:
+            section_match = unit_section
     section_is_relative = detect_relative_section(payload.question)
 
     conversation_history = _load_history(db, conversation.id)
 
-    # ---- run the pipeline -------------------------------------------------
-    pipeline = get_rag_pipeline()
-    result = await pipeline.answer(
-        db,
-        workspace_id=workspace.id,
-        question=payload.question.strip(),
-        mode=mode,
-        top_k=payload.top_k,
-        candidate_k=payload.candidate_k,
-        document_ids=resolved_scope,
-        use_rerank=payload.use_rerank,
-        web_sources=web_sources or None,
-        language=payload.language,
-        trace=trace,
-        history=conversation_history,
-        page_number=requested_page,
-        section=section_match,
-    )
-
-    # ---- record what was actually searched (brief section 43) -------------
-    # An answer is only interpretable next to its scope: "5 excerpts" means
-    # something different when 2 documents were in scope versus 12.
     workspace_ready = (
         db.scalar(
             select(func.count(Document.id)).where(
@@ -556,35 +614,81 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         )
         or 0
     )
+
+    return _AskContext(
+        workspace=workspace,
+        conversation=conversation,
+        user_message=user_message,
+        mode=mode,
+        question=payload.question.strip(),
+        trace=trace,
+        web_sources=web_sources,
+        resolved_scope=resolved_scope,
+        workspace_ready=workspace_ready,
+        scope_names=scope_names,
+        requested_page=requested_page,
+        page_phrase=page_phrase,
+        relative_note=relative_note,
+        section_match=section_match,
+        section_is_relative=section_is_relative,
+        conversation_history=conversation_history,
+    )
+
+
+def _annotate_trace(ctx: _AskContext, result: RAGAnswer) -> None:
+    """Attach the per-question scope, references, and retrieved-source summary
+    to the `candidate_retrieval` trace event the pipeline already recorded.
+
+    An answer is only interpretable next to its scope: "5 excerpts" means
+    something different when 2 documents were in scope versus 12.
+    """
+    trace = ctx.trace
     for event in trace.events:
         if event.stage != "candidate_retrieval":
             continue
-        if requested_page is not None:
+        event.data["question"] = ctx.question
+
+        # WHAT WAS ACTUALLY RETRIEVED, in the trace rather than only on the message.
+        # The Learning panel builds its per-message diagram from the real evidence.
+        retrieved_chunks = (result.retrieval.chunks if result.retrieval else []) or []
+        if retrieved_chunks:
+            event.data["top_sources"] = [
+                {
+                    "label": chunk.citation_label(),
+                    "document": chunk.document_name,
+                    "section": str((chunk.metadata or {}).get("section") or ""),
+                    "score": round(float(chunk.score or 0.0), 4),
+                    "rank": chunk.rank,
+                }
+                for chunk in retrieved_chunks[:6]
+            ]
+        if ctx.requested_page is not None:
             event.data.update(
                 {
-                    "page_reference": page_phrase,
-                    "page_filter_applied": requested_page,
+                    "page_reference": ctx.page_phrase,
+                    "page_filter_applied": ctx.requested_page,
                 }
             )
-            if relative_note:
-                event.data["page_resolution"] = relative_note
-        if section_match:
-            event.data["section_filter_applied"] = section_match
-        if section_is_relative:
-            # Detected but not resolved: the section the conversation is in is not
-            # something this layer knows, and guessing one would be worse than
-            # answering without the filter.
-            event.data["relative_section"] = section_is_relative
-        if conversation_history:
-            event.data["conversation_turns_used"] = len(conversation_history)
+            if ctx.relative_note:
+                event.data["page_resolution"] = ctx.relative_note
+        if ctx.section_match:
+            event.data["section_filter_applied"] = ctx.section_match
+        if ctx.section_is_relative:
+            event.data["relative_section"] = ctx.section_is_relative
+        if ctx.conversation_history:
+            event.data["conversation_turns_used"] = len(ctx.conversation_history)
 
-        if resolved_scope is None:
+        event.data["scope_file_names"] = (
+            list(ctx.scope_names) if ctx.resolved_scope else []
+        )
+
+        if ctx.resolved_scope is None:
             event.data.update(
                 {
                     "retrieval_scope": "workspace",
                     "scope_document_ids": [],
-                    "workspace_documents_available": workspace_ready,
-                    "workspace_documents_searched": workspace_ready,
+                    "workspace_documents_available": ctx.workspace_ready,
+                    "workspace_documents_searched": ctx.workspace_ready,
                     "scope_note": (
                         "No chat scope was set, so the whole workspace was searched."
                     ),
@@ -594,22 +698,34 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
             event.data.update(
                 {
                     "retrieval_scope": "chat",
-                    "scope_document_ids": list(resolved_scope),
-                    "workspace_documents_available": workspace_ready,
-                    "workspace_documents_searched": len(resolved_scope),
+                    "scope_document_ids": list(ctx.resolved_scope),
+                    "workspace_documents_available": ctx.workspace_ready,
+                    "workspace_documents_searched": len(ctx.resolved_scope),
                     "scope_note": (
-                        f"Retrieval was limited to {len(resolved_scope)} selected "
-                        f"document(s) out of {workspace_ready} in the workspace."
+                        f"Retrieval was limited to {len(ctx.resolved_scope)} selected "
+                        f"document(s) out of {ctx.workspace_ready} in the workspace."
                     ),
                 }
             )
 
-    # ---- persist the assistant turn ---------------------------------------
+
+def _persist_assistant_turn(
+    db: Session, ctx: _AskContext, result: RAGAnswer
+) -> tuple[Message, AskResponse]:
+    """Persist the answer, its trace and its analytics row. Returns the loaded
+    Message (with a real id) and the assembled AskResponse.
+
+    This is the ONLY place an assistant Message is written, so the two endpoints
+    cannot drift on any of the columns, the QueryLog shape, or the response
+    envelope.
+    """
+    _annotate_trace(ctx, result)
+
     assistant_message = Message(
-        conversation_id=conversation.id,
+        conversation_id=ctx.conversation.id,
         role="assistant",
         content=result.answer,
-        ai_mode=mode,
+        ai_mode=ctx.mode,
         provider=result.provider,
         model=result.model,
         used_fallback=result.used_fallback,
@@ -618,49 +734,29 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         grounding_detail=result.grounding.as_dict() if result.grounding else {},
         latency_ms=result.total_ms,
         token_usage=result.token_usage,
-        trace_id=trace.trace_id,
+        trace_id=ctx.trace.trace_id,
         retrieval=_with_scope(
             result.retrieval.as_dict() if result.retrieval else {},
-            resolved_scope,
-            workspace_ready,
+            ctx.resolved_scope,
+            ctx.workspace_ready,
         ),
         citations=result.citation_dicts,
-        web_search_used=bool(web_sources),
-        web_sources=web_sources,
+        web_search_used=bool(ctx.web_sources),
+        web_sources=ctx.web_sources,
     )
     db.add(assistant_message)
     db.commit()
     db.refresh(assistant_message)
 
-    # ---- persist the trace ------------------------------------------------
-    #
-    # `created_at` is passed explicitly rather than left to the column default.
-    # The default fires at INSERT time, which is AFTER the answer has finished, so
-    # without this every event would be stamped with the same second - making the
-    # timestamped trace useless and, worse, misleading: it would imply the whole
-    # pipeline ran instantaneously.
-    for event in trace.events:
-        db.add(
-            TraceEvent(
-                message_id=assistant_message.id,
-                trace_id=trace.trace_id,
-                seq=event.seq,
-                stage=event.stage,
-                status=event.status,
-                duration_ms=event.duration_ms,
-                event_data={**event.data, "label": event.label},
-                created_at=event.created_at or utcnow(),
-            )
-        )
+    _persist_trace(db, message_id=assistant_message.id, trace=ctx.trace)
 
-    # ---- analytics row ----------------------------------------------------
     retrieval = result.retrieval
     db.add(
         QueryLog(
-            workspace_id=workspace.id,
-            user_id=user.id,
+            workspace_id=ctx.workspace.id,
+            user_id=ctx.conversation.user_id,
             message_id=assistant_message.id,
-            ai_mode=mode,
+            ai_mode=ctx.mode,
             provider=result.provider,
             model=result.model,
             retrieved_count=retrieval.candidates_retrieved if retrieval else 0,
@@ -676,25 +772,28 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         )
     )
 
-    conversation.updated_at = utcnow()
+    ctx.conversation.updated_at = utcnow()
     db.commit()
 
-    # ---- respond ----------------------------------------------------------
     grounding_out = (
-        GroundingOut(**{k: v for k, v in result.grounding.as_dict().items() if k in GroundingOut.model_fields})
+        GroundingOut(
+            **{
+                k: v
+                for k, v in result.grounding.as_dict().items()
+                if k in GroundingOut.model_fields
+            }
+        )
         if result.grounding
         else None
     )
-
     citation_dicts = result.citation_dicts
     citations_out = [
         CitationOut(**{k: v for k, v in c.items() if k in CitationOut.model_fields})
         for c in citation_dicts
     ]
-
-    return AskResponse(
+    response = AskResponse(
         message=MessageOut.model_validate(assistant_message),
-        conversation_id=conversation.id,
+        conversation_id=ctx.conversation.id,
         answer=result.answer,
         provider_label=result.provider_label(),
         is_extractive_failsafe=result.is_extractive_failsafe,
@@ -702,9 +801,254 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
         citations=citations_out,
         retrieval=result.retrieval.as_dict() if result.retrieval else {},
         context=result.context.as_dict() if result.context else {},
-        trace=trace.summary(),
-        web_sources=web_sources,
+        trace=ctx.trace.summary(),
+        web_sources=ctx.web_sources,
     )
+    return assistant_message, response
+
+
+# ---------------------------------------------------------------------------
+# Ask (buffered, non-streaming)
+# ---------------------------------------------------------------------------
+@router.post("/chat/ask", response_model=AskResponse)
+async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskResponse:
+    """Ask a question and get a grounded, cited answer.
+
+    This is the one-shot variant of the same path `/chat/ask/stream` exposes
+    incrementally — same preparation, same pipeline, same persistence, same
+    response envelope. Only the timing differs.
+    """
+    ctx = _prepare_ask(db, user, payload)
+    pipeline = get_rag_pipeline()
+    try:
+        result = await pipeline.answer(
+            db,
+            workspace_id=ctx.workspace.id,
+            question=ctx.question,
+            mode=ctx.mode,
+            top_k=payload.top_k,
+            candidate_k=payload.candidate_k,
+            document_ids=ctx.resolved_scope,
+            use_rerank=payload.use_rerank,
+            web_sources=ctx.web_sources or None,
+            language=payload.language,
+            trace=ctx.trace,
+            history=ctx.conversation_history,
+            page_number=ctx.requested_page,
+            section=ctx.section_match,
+        )
+    except CarinaaError as exc:
+        _persist_failure_trace(db, ctx, exc)
+        raise _annotated_error(exc, ctx) from exc
+
+    _, response = _persist_assistant_turn(db, ctx, result)
+    return response
+
+
+def _persist_failure_trace(
+    db: Session, ctx: _AskContext, exc: CarinaaError
+) -> None:
+    """Persist the events recorded up to the failed stage against the USER row.
+
+    A FAILED RUN STILL HAS A TRACE, AND IT IS WORTH KEEPING.
+    The panel's job is to say WHICH stage failed. If a failed run's events were
+    discarded, the panel would fall back to the previous successful run and show
+    a fully completed pipeline next to an error — exactly the dishonesty this
+    project exists to avoid.
+    """
+    with contextlib.suppress(Exception):
+        _persist_trace(db, message_id=ctx.user_message.id, trace=ctx.trace)
+
+
+def _annotated_error(exc: CarinaaError, ctx: _AskContext) -> CarinaaError:
+    """Wrap a pipeline failure with the question, message id and trace summary,
+    so the client can render the failure honestly.
+    """
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    return CarinaaError(
+        exc.message,
+        code=exc.code,
+        status_code=exc.status_code,
+        detail={
+            **detail,
+            "failed": True,
+            "question": ctx.question,
+            "message_id": ctx.user_message.id,
+            "trace": ctx.trace.summary(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ask (real token-by-token streaming over Server-Sent Events)
+# ---------------------------------------------------------------------------
+@router.post("/chat/ask/stream")
+async def ask_stream(
+    payload: AskRequest, user: CurrentUser, db: DbSession
+):
+    """Stream a grounded, cited answer as Server-Sent Events.
+
+    The events:
+        ready   - emitted first; conversation + user_message ids so the client can
+                  align the streamed answer with the optimistic row it rendered.
+        stage   - mirrors a TraceRecorder `add` call, fired the moment a real
+                  pipeline stage finishes. Never scheduled on a timer - the
+                  events ARE the schedule.
+        token   - a real provider fragment, in order.
+        done    - full AskResponse payload for the completed answer.
+        error   - the failure envelope (`code`, `message`, `detail`, `trace`)
+                  that `/chat/ask` would have returned as HTTP 4xx/5xx, wrapped
+                  as a normal SSE frame so the client can render a partial-run
+                  failure the same way as a whole-run failure.
+
+    The client MUST render the streamed tokens as an *uncommitted draft* until
+    `done` arrives. If a mid-stream failure occurs, only the question row is
+    persisted and the draft is discarded. That is what keeps the canonical
+    answer a single canonical fact: whatever the browser showed during the
+    stream, the persisted state is the answer.
+    """
+    # Everything that raises a normal HTTP error (workspace not found, page
+    # out of range, ambiguous document, ...) still raises BEFORE the SSE
+    # headers are written. Once we return a StreamingResponse we are on the
+    # stream, and errors have to be reported as `error` SSE frames instead.
+    ctx = _prepare_ask(db, user, payload)
+
+    pipeline = get_rag_pipeline()
+    loop = asyncio.get_running_loop()
+    events: asyncio.Queue = asyncio.Queue()
+
+    def _push_stage(event: Any) -> None:
+        # `event` may be emitted from the retriever's worker thread
+        # (`asyncio.to_thread(retriever.retrieve, ...)`). `call_soon_threadsafe`
+        # works uniformly from the loop thread and from a worker thread, so
+        # there is only one path.
+        loop.call_soon_threadsafe(
+            events.put_nowait,
+            {
+                "type": "stage",
+                "seq": event.seq,
+                "stage": event.stage,
+                "label": event.label,
+                "status": event.status,
+                "duration_ms": event.duration_ms,
+                "data": event.data,
+                "created_at": event.created_at.isoformat() if event.created_at else None,
+            },
+        )
+
+    def _push_pipeline(kind: str, **payload: Any) -> None:
+        events.put_nowait({"type": kind, **payload})
+
+    ctx.trace.subscribe(_push_stage)
+
+    async def _drain() -> None:
+        """Consume `pipeline.stream_answer` and forward its events to the queue.
+
+        Errors are converted to the same shape the buffered endpoint raises, so
+        the client's error renderer stays single-source.
+        """
+        try:
+            async for event in pipeline.stream_answer(
+                db,
+                workspace_id=ctx.workspace.id,
+                question=ctx.question,
+                mode=ctx.mode,
+                top_k=payload.top_k,
+                candidate_k=payload.candidate_k,
+                document_ids=ctx.resolved_scope,
+                use_rerank=payload.use_rerank,
+                web_sources=ctx.web_sources or None,
+                language=payload.language,
+                trace=ctx.trace,
+                history=ctx.conversation_history,
+                page_number=ctx.requested_page,
+                section=ctx.section_match,
+            ):
+                if event["type"] == "delta":
+                    _push_pipeline("token", text=event["text"])
+                elif event["type"] == "done":
+                    _push_pipeline("final_result", result=event["result"])
+                    break
+        except CarinaaError as exc:
+            _persist_failure_trace(db, ctx, exc)
+            _push_pipeline("stream_error", error=_annotated_error(exc, ctx))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Streaming ask failed unexpectedly")
+            _push_pipeline(
+                "stream_error",
+                error=CarinaaError(
+                    str(exc), code="internal_error", status_code=500
+                ),
+            )
+
+    async def _generator() -> AsyncIterator[str]:
+        yield _sse_frame("ready", {
+            "conversation_id": ctx.conversation.id,
+            "user_message_id": ctx.user_message.id,
+            "trace_id": ctx.trace.trace_id,
+            "mode": ctx.mode,
+        })
+
+        drain_task = asyncio.create_task(_drain())
+        try:
+            while True:
+                try:
+                    item = await events.get()
+                except asyncio.CancelledError:
+                    raise
+                kind = item.get("type")
+                if kind == "stage":
+                    yield _sse_frame("stage", item)
+                elif kind == "token":
+                    yield _sse_frame("token", {"text": item["text"]})
+                elif kind == "final_result":
+                    try:
+                        _, response = _persist_assistant_turn(
+                            db, ctx, item["result"]
+                        )
+                    except Exception as exc:  # noqa: BLE001 - persistence is best-effort post-stream
+                        logger.exception("Persisting streamed answer failed")
+                        yield _sse_frame("error", {
+                            "code": "persistence_error",
+                            "message": "The answer was produced but could not be saved.",
+                            "detail": {"reason": exc.__class__.__name__},
+                        })
+                        break
+                    yield _sse_frame("done", json.loads(response.model_dump_json()))
+                    break
+                elif kind == "stream_error":
+                    err: CarinaaError = item["error"]
+                    yield _sse_frame("error", {
+                        "code": err.code,
+                        "message": err.message,
+                        "detail": err.detail or {},
+                    })
+                    break
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _sse_frame(event: str, data: Any) -> str:
+    """One SSE frame. Multi-line data payloads are joined with `\\n` inside
+    consecutive `data:` lines, as the spec requires; a JSON body never has raw
+    newlines here, but the format is exact anyway so this stays correct for
+    future event shapes.
+    """
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +1075,15 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         detected, _phrase, _relative, _direction = detect_page_reference(payload.question)
         requested_page = detected
 
+    # Mirror the ask endpoint's unit handling. Without this the labs would show a
+    # different search from what a real answer performs - the exact disagreement the
+    # brief warns about.
+    section_filter = payload.section
+    if section_filter is None:
+        section_filter = match_unit_section(
+            payload.question, _scope_sections(db, scope, workspace.id)
+        )
+
     outcome = await retrieve_only(
         db,
         workspace_id=workspace.id,
@@ -739,7 +1092,7 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         candidate_k=payload.candidate_k,
         document_ids=scope,
         page_number=requested_page,
-        section=payload.section,
+        section=section_filter,
         use_rerank=payload.use_rerank,
     )
 
@@ -792,6 +1145,11 @@ def get_trace(message_id: int, user: CurrentUser, db: DbSession) -> TraceOut:
         event_count=len(stages),
         total_ms=sum(s["duration_ms"] for s in stages),
         stages=stages,
+        # Learning Mode is per-message, so the panel needs the question this answer
+        # belongs to. Resolved server-side because an assistant row stores no
+        # question, and guessing it on the client would be wrong for any message
+        # that is not the latest turn.
+        question=_question_for(db, message),
         summary={
             "provider": message.provider,
             "model": message.model,

@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import settings
-from app.features.languages import get_language, is_supported
+from app.features.languages import get_language, is_supported, speech_candidates
 from app.rag.citations import speech_text
 
 # Some voices stumble on very long single utterances, so the client is advised to
@@ -53,6 +53,10 @@ class SpeechPayload:
     text: str
     language: str
     speech_code: str
+    #: Ordered preferred BCP-47 tags (preferred first, fallbacks after), so the
+    #: client treats "the exact regional voice is missing but a sibling exists"
+    #: as success. See `languages.speech_candidates`.
+    speech_candidates: list[str]
     native_name: str
     characters: int
     voice_hint: str
@@ -63,6 +67,7 @@ class SpeechPayload:
             "text": self.text,
             "language": self.language,
             "speech_code": self.speech_code,
+            "speech_candidates": self.speech_candidates,
             "native_name": self.native_name,
             "characters": self.characters,
             "sentences": self.sentences,
@@ -109,6 +114,7 @@ def prepare_speech(text: str, language: str = "en") -> SpeechPayload:
         text=spoken,
         language=code,
         speech_code=language_info.speech_code,
+        speech_candidates=speech_candidates(code),
         native_name=language_info.native_name,
         characters=len(spoken),
         voice_hint=voice_hint,

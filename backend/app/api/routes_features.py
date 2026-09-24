@@ -29,7 +29,7 @@ from app.features.languages import as_list as languages_as_list
 from app.features.languages import get_language
 from app.features.read_aloud import prepare_speech
 from app.features.shorten import level_options, shorten_answer
-from app.features.translate import translate_answer
+from app.features.translate import translate_answer, translate_text
 from app.llm.adapter import get_llm_adapter
 from app.llm.base import LLMError
 from app.rag.prompts import build_explain_messages
@@ -41,6 +41,8 @@ from app.schemas.chat import (
     ShortenRequest,
     SpeechOut,
     SpeechRequest,
+    TextTranslateOut,
+    TextTranslateRequest,
     TranslateRequest,
     VariantOut,
 )
@@ -65,6 +67,22 @@ def _require_message(db: DbSession, user: CurrentUser, message_id: int) -> Messa
 def _mode_for(db: DbSession, message: Message) -> str:
     conversation = db.get(Conversation, message.conversation_id)
     return (conversation.ai_mode if conversation else None) or settings.default_ai_mode
+
+
+def _resolve_mode(db: DbSession, user: CurrentUser, requested: str | None) -> str:
+    """The AI mode for a request that is not tied to a stored message.
+
+    Same precedence as `/chat/ask`: an explicit request wins, then the user's saved
+    preference, then the server default. It matters here because Offline mode must
+    refuse to translate rather than quietly reaching for an online provider - so
+    guessing "online" would break the product's central guarantee.
+    """
+    if requested in ("online", "offline"):
+        return requested
+    preference = (user.preferences or {}).get("default_ai_mode")
+    if preference in ("online", "offline"):
+        return preference
+    return settings.default_ai_mode
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +157,39 @@ async def translate(
 
 
 # ---------------------------------------------------------------------------
+# Translate arbitrary text (Learning Mode panel)
+# ---------------------------------------------------------------------------
+@router.post("/translate-text", response_model=TextTranslateOut)
+async def translate_free_text(
+    payload: TextTranslateRequest, user: CurrentUser, db: DbSession
+) -> TextTranslateOut:
+    """Translate the Learning panel's explanation into another language.
+
+    Deliberately NOT `/features/translate`: that endpoint is keyed to a stored
+    answer and writes an `AnswerVariant`. The Learning explanation is teaching
+    prose, not a grounded answer, and storing it as a variant of one would blur the
+    line this project exists to keep - a variant is a presentation of the ANSWER,
+    and nothing else. So this handler translates text and stores nothing.
+
+    `user` is required even though no row is written: the endpoint calls an LLM, and
+    an unauthenticated endpoint that spends provider quota is not acceptable.
+    """
+    mode = _resolve_mode(db, user, payload.mode)
+
+    outcome = await translate_text(
+        text=payload.text, target_language=payload.language, mode=mode
+    )
+
+    return TextTranslateOut(
+        language=outcome.language,
+        content=outcome.content,
+        provider=outcome.provider,
+        model=outcome.model,
+        warning=outcome.warning,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shorten
 # ---------------------------------------------------------------------------
 @router.post("/shorten", response_model=VariantOut)
@@ -201,6 +252,7 @@ def speech(payload: SpeechRequest, user: CurrentUser, db: DbSession) -> SpeechOu
         message_id=message.id,
         language=result.language,
         speech_code=result.speech_code,
+        speech_candidates=result.speech_candidates,
         text=result.text,
         characters=result.characters,
         voice_hint=result.voice_hint,

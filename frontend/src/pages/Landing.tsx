@@ -169,7 +169,7 @@ export default function Landing() {
             <div className="mb-5 inline-flex animate-fade-up items-center gap-2 rounded-full border border-brand/25 bg-brand/8 px-3 py-1">
               <Sparkles className="h-3.5 w-3.5 text-brand" />
               <span className="text-2xs font-medium text-brand">
-                Retrieval-Augmented Generation, built from the ground up
+                An AI chatbot that answers using your documents
               </span>
             </div>
 
@@ -179,9 +179,9 @@ export default function Landing() {
             </h1>
 
             <p className="mx-auto mt-5 max-w-2xl animate-fade-up text-sm leading-relaxed text-muted sm:text-base">
-              Carinaa is a document intelligence platform that shows its work. Ask a question
-              about your own files and get a grounded answer, the exact passages behind it,
-              and a measured trace of every step the system took to get there.
+              Ask questions normally. Carinaa finds the relevant passages in your own files,
+              answers from them, and shows you exactly where every claim came from — and with
+              Learning Mode, you can watch how it works, step by step.
             </p>
 
             <div className="mt-8 flex flex-wrap items-center justify-center gap-3">

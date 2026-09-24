@@ -21,7 +21,7 @@ THE HONESTY RULE
 ----------------
 `LLMResponse.provider` and `.used_fallback` are always populated with what
 ACTUALLY served the request. If Gemini failed and Groq answered, the user sees
-"Groq · Fallback". We never present a fallback as if it were the primary, and we
+"Gemini · Fallback". We never present a fallback as if it were the primary, and we
 never silently switch from Offline to Online.
 """
 
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +169,50 @@ class LLMProvider(Protocol):
         """Produce a completion. Raises LLMError on failure."""
         ...
 
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield text deltas as the provider produces them.
+
+        This is REAL streaming: each yielded string is a fragment the provider
+        actually sent, in order. It is never a complete answer chopped up after
+        the fact, because a fake stream would make the UI's central claim - that
+        you are watching the answer being produced - untrue.
+        """
+        ...
+
     async def list_models(self) -> list[str]:
         """Live model list from the provider, so IDs never go stale."""
         ...
 
     def status(self) -> ProviderStatus:
         ...
+
+
+async def iter_sse_data(lines: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Yield the `data:` payload of each Server-Sent Event line.
+
+    Both Groq (OpenAI-compatible) and Gemini stream as SSE. They differ only in the
+    JSON inside the event, not in the framing, so the framing is parsed once here.
+
+    A line is only yielded when it carries a payload; comments (":" heartbeat),
+    blank separators and the terminal "data: [DONE]" sentinel are filtered out so
+    every caller receives plain JSON.
+    """
+    async for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        yield payload
 
 
 # ---------------------------------------------------------------------------

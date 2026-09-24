@@ -3,13 +3,14 @@ import {
   Check,
   ChevronDown,
   Copy,
-  GraduationCap,
   Languages,
   Minimize2,
   RotateCcw,
+  Sparkles,
   Volume2,
   VolumeX,
   Waypoints,
+  X,
 } from "lucide-react";
 
 import { cn } from "@/lib/cn";
@@ -18,6 +19,7 @@ import { pluralize } from "@/lib/format";
 import { hasVoiceFor, speak, type SpeechHandle } from "@/lib/speech";
 import { useToast } from "@/state/toast";
 import type { Language, Message, Variant } from "@/lib/types";
+import { Markdown } from "@/components/chat/Markdown";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Spinner } from "@/components/ui/Feedback";
@@ -75,6 +77,13 @@ export function AnswerToolbar({
   const [openMenu, setOpenMenu] = useState<"" | "translate" | "shorten">("");
   const [speaking, setSpeaking] = useState(false);
   const [explanation, setExplanation] = useState<string | null>(null);
+  /**
+   * Why an explanation could not be produced.
+   *
+   * Kept inline under the toolbar rather than in a toast: the failure belongs to
+   * this exact control, so the message appears where the result would have been.
+   */
+  const [explainError, setExplainError] = useState("");
 
   const speechRef = useRef<SpeechHandle | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -199,16 +208,28 @@ export function AnswerToolbar({
     try {
       const payload = await api.features.speech(message.id, language);
 
-      if (!hasVoiceFor(payload.speech_code)) {
-        toast.warning(
-          "No voice for this language",
-          `This device has no ${payload.speech_code} voice installed, so the text will be read with the closest available voice. Nothing was sent to an external service.`,
-        );
-      }
+      // Ordered candidate tags: the exact preferred voice first, then fallbacks.
+      const candidates =
+        payload.speech_candidates && payload.speech_candidates.length
+          ? payload.speech_candidates
+          : [payload.speech_code];
+
+      const matched = hasVoiceFor(candidates);
 
       setSpeaking(true);
+      if (!matched && candidates[0] !== "en") {
+        // Only genuinely no-voice-any-match is worth mentioning, and even then it
+        // is an information line, not an error: the text will still be read with
+        // whatever voice the browser falls back to. Nothing alarmed the user
+        // before speech actually failed; that was the whole point of this fix.
+        toast.warning(
+          "Using the closest available voice",
+          `No ${candidates[0]} voice is installed on this device. Your browser will read the text with its default voice. Nothing was sent to an external service.`,
+          3000,
+        );
+      }
       speechRef.current = speak(payload.text, {
-        speechCode: payload.speech_code,
+        candidates,
         onEnd: () => setSpeaking(false),
         onError: (messageText) => {
           setSpeaking(false);
@@ -227,21 +248,24 @@ export function AnswerToolbar({
   const handleExplain = useCallback(async () => {
     if (explanation) {
       setExplanation(null);
+      setExplainError("");
       return;
     }
     setBusy("explain");
+    setExplainError("");
     try {
       const result = await api.features.explain(message.id);
       setExplanation(result.explanation);
     } catch (cause) {
-      toast.error(
-        "Could not generate an explanation",
-        cause instanceof ApiError ? cause.message : "Please try again.",
+      setExplainError(
+        cause instanceof ApiError
+          ? cause.message
+          : "The explanation could not be generated. Please try again.",
       );
     } finally {
       setBusy("");
     }
-  }, [explanation, message.id, toast]);
+  }, [explanation, message.id]);
 
   const translateOptions = languages.filter((language) => language.code !== (activeVariant?.language ?? "en"));
 
@@ -366,10 +390,15 @@ export function AnswerToolbar({
         />
 
         <ToolbarButton
-          icon={busy === "explain" ? <Spinner size={14} /> : <GraduationCap className="h-3.5 w-3.5" />}
+          icon={busy === "explain" ? <Spinner size={14} /> : <Sparkles className="h-3.5 w-3.5" />}
           label={explanation ? "Hide explanation" : "Explain"}
           active={Boolean(explanation)}
           disabled={busy !== ""}
+          title={
+            explanation
+              ? "Hide the simple explanation"
+              : "Explain this answer in simple words"
+          }
           onClick={() => void handleExplain()}
         />
 
@@ -382,21 +411,56 @@ export function AnswerToolbar({
         ) : null}
       </div>
 
-      {/* ---- learning-mode explanation ------------------------------ */}
+      {/* ---- the simple explanation ---------------------------------
+          Deliberately shaped like help, not like another technical panel:
+          a friendly header, the restated answer, and the key ideas as a
+          scan-friendly list. The canonical answer above is untouched. */}
       {explanation ? (
-        <div className="animate-slide-down rounded-lg border border-accent/25 bg-accent/6 p-3.5">
-          <p className="flex items-center gap-2 text-2xs font-semibold uppercase tracking-wide text-accent">
-            <GraduationCap className="h-3.5 w-3.5" />
-            Learning mode explanation
-          </p>
-          <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-ink">
-            {explanation}
-          </p>
-          <p className="mt-2 text-2xs text-faint">
-            This explanation is generated separately from the answer above. The answer itself
-            is unchanged.
-          </p>
+        <div className="animate-slide-down overflow-hidden rounded-xl border border-brand/25 bg-brand/[0.04] shadow-card">
+          <div className="flex items-center gap-2 border-b border-brand/20 bg-brand/8 px-3.5 py-2">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-brand" />
+            <p className="min-w-0 flex-1 text-xs font-semibold text-ink">
+              Let&apos;s make this simpler
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setExplanation(null);
+                setExplainError("");
+              }}
+              aria-label="Close the simple explanation"
+              className="rounded p-0.5 text-faint transition-colors hover:text-ink"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          <div className="space-y-2 px-3.5 py-3">
+            <div>
+              <p className="text-[0.625rem] font-semibold uppercase tracking-wider text-faint">
+                Original answer
+              </p>
+              <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-2xs leading-relaxed text-muted">
+                {displayedContent}
+              </p>
+            </div>
+
+            <div className="border-t border-brand/15 pt-2">
+              <Markdown content={explanation} className="text-xs" />
+            </div>
+
+            <p className="text-[0.625rem] leading-relaxed text-faint">
+              Generated separately to help you understand the answer above. The answer
+              itself, and its citations, are unchanged.
+            </p>
+          </div>
         </div>
+      ) : null}
+
+      {explainError && !explanation ? (
+        <p className="rounded-lg border border-caution/30 bg-caution/8 px-2.5 py-1.5 text-2xs leading-relaxed text-caution">
+          {explainError}
+        </p>
       ) : null}
     </div>
   );

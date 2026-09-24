@@ -587,3 +587,411 @@ def test_expansion_is_a_no_op_without_a_reference() -> None:
     expanded, note = expand_unit_reference(question)
     assert expanded == question
     assert note == ""
+
+
+# ---------------------------------------------------------------------------
+# Lexical blend
+# ---------------------------------------------------------------------------
+def _candidate(content: str, score: float, section: str = "") -> Any:
+    from app.rag.vectorstore import RetrievedChunk
+
+    return RetrievedChunk(
+        vector_id=content[:8],
+        workspace_id=1,
+        document_id=1,
+        chunk_index=0,
+        content=content,
+        metadata={"section": section} if section else {},
+        score=score,
+    )
+
+
+def test_lexical_blend_lets_an_exact_reference_overtake_a_semantic_favourite() -> None:
+    """The failure this fixes: an embedding barely distinguishes UNIT I from UNIT III,
+    so the wrong unit won on topic similarity alone."""
+    from app.rag.retriever import apply_lexical_blend
+
+    candidates = [
+        _candidate("Design thinking begins with empathy.", 0.42, "UNIT I - DESIGN THINKING PRINCIPLES"),
+        _candidate("Concept generation outlines steps.", 0.31, "UNIT III - CONCEPT GENERATION"),
+    ]
+
+    ranked = apply_lexical_blend(candidates, "What is the name of UNIT III?")
+    assert "UNIT III" in str(ranked[0].metadata.get("section")), (
+        "the chunk that literally contains the reference should now lead"
+    )
+
+
+def test_lexical_blend_preserves_the_pre_blend_score() -> None:
+    """The blend amends; it must not erase what retrieval believed on its own, or the
+    trace stops being able to explain the ranking."""
+    from app.rag.retriever import apply_lexical_blend
+
+    candidates = [_candidate("Some content about units.", 0.4, "UNIT I - INTRO")]
+    ranked = apply_lexical_blend(candidates, "What is UNIT I?")
+    assert ranked[0].original_score == 0.4
+    assert ranked[0].score != 0.4
+
+
+def test_lexical_blend_does_not_dominate_a_paraphrase() -> None:
+    """Too high a weight would break meaning-based search. A paraphrase shares few
+    literal terms, so semantics must still decide."""
+    from app.rag.retriever import apply_lexical_blend
+
+    topical = _candidate("Consolidation reduces the number of physical servers needed.", 0.44, "UNIT IV")
+    incidental = _candidate("Design thinking draws on the designer's toolkit.", 0.20, "UNIT I")
+
+    ranked = apply_lexical_blend([incidental, topical], "How does virtualisation cut costs?")
+    assert "physical servers" in ranked[0].content
+
+
+def test_lexical_blend_is_a_no_op_without_query_terms() -> None:
+    from app.rag.retriever import apply_lexical_blend
+
+    candidates = [_candidate("Anything.", 0.3)]
+    ranked = apply_lexical_blend(candidates, "the of and")
+    assert ranked[0].score == 0.3
+
+
+def test_retrieved_chunk_keeps_a_pre_blend_score_slot() -> None:
+    """Regression: RetrieverChunk is @dataclass(slots=True), so assigning a field the
+    class does not declare raises AttributeError at request time and returns HTTP 500."""
+    from app.rag.vectorstore import RetrievedChunk
+
+    chunk = _candidate("x", 0.1)
+    chunk.original_score = 0.1
+    assert chunk.original_score == 0.1
+    assert isinstance(chunk, RetrievedChunk)
+
+
+# ---------------------------------------------------------------------------
+# Unit -> section index filter (sections 17, 18): the real fix
+# ---------------------------------------------------------------------------
+UNIT_SECTIONS = [
+    "UNIT I - DESIGN THINKING PRINCIPLES",
+    "UNIT II - DISCOVERING OPPORTUNITIES",
+    "UNIT III - CONCEPT GENERATION",
+    "UNIT IV - DOCUMENT AND COMMUNICATE",
+    "UNIT V - FORGE INNOVATION RUBRIC",
+]
+
+
+@pytest.mark.parametrize(
+    "question,expected_section",
+    [
+        ("What is the name of UNIT III?", "UNIT III - CONCEPT GENERATION"),
+        ("What does the third unit say?", "UNIT III - CONCEPT GENERATION"),
+        ("UNIT IV", "UNIT IV - DOCUMENT AND COMMUNICATE"),
+        ("Summarise Unit V", "UNIT V - FORGE INNOVATION RUBRIC"),
+        ("What is the second unit about?", "UNIT II - DISCOVERING OPPORTUNITIES"),
+    ],
+)
+def test_a_unit_reference_resolves_to_its_section(question: str, expected_section: str) -> None:
+    """The fix itself.
+
+    Unlike a score blend, this FILTERS: every chunk outside the named unit is removed,
+    which is what "do not return unrelated chunks" actually requires. A blend can only
+    nudge, so the wrong unit can still win — which is exactly what was happening.
+    """
+    from app.rag.units import match_unit_section
+
+    assert match_unit_section(question, UNIT_SECTIONS) == expected_section
+
+
+def test_unit_matching_ignores_dashes_and_spacing() -> None:
+    """Real PDF headings use en dashes and inconsistent spacing — 'UNIT – IV'. Comparing
+    raw strings would only work on the tidiest documents."""
+    from app.rag.units import match_unit_section
+
+    headings = ["OME354 UNIT \u2013 I DESIGN THINKING", "UNIT \u2013 IV CONCEPT GENERATION"]
+    assert match_unit_section("UNIT IV", headings) == "UNIT \u2013 IV CONCEPT GENERATION"
+
+
+def test_a_unit_that_has_no_heading_is_not_invented() -> None:
+    """This was the original bug: the document has headings for I, IV and V, and none for
+    II or III. Filtering on a unit whose heading does not exist must return None so the
+    caller falls back to scoring instead of filtering to nothing and losing the answer.
+    """
+    from app.rag.units import match_unit_section
+
+    only_some = ["UNIT I - INTRO", "UNIT IV - DOCS"]
+    assert match_unit_section("What is UNIT III?", only_some) is None
+
+
+def test_a_question_without_a_unit_has_no_section_filter() -> None:
+    """Over-filtering would be worse than under-filtering: it would hide the answer."""
+    from app.rag.units import match_unit_section
+
+    assert match_unit_section("How does virtualisation cut costs?", UNIT_SECTIONS) is None
+
+
+# ---------------------------------------------------------------------------
+# Provider model chaining
+# ---------------------------------------------------------------------------
+def test_model_chain_keeps_the_configured_model_first() -> None:
+    """An explicit operator choice must win. The chain exists to pick up the pieces
+    only after that choice fails."""
+    from app.llm.adapter import LLMAdapter
+
+    chain = LLMAdapter._model_chain("a,b,c", "zz")
+    assert chain[0] == "zz", "the configured model must be tried first"
+    assert chain == ["zz", "a", "b", "c"]
+
+
+def test_model_chain_deduplicates_and_tolerates_blank_entries() -> None:
+    from app.llm.adapter import LLMAdapter
+
+    chain = LLMAdapter._model_chain(" a , , a , b ", "a")
+    assert chain == ["a", "b"]
+
+
+def test_model_chain_falls_back_when_the_list_is_empty() -> None:
+    from app.llm.adapter import LLMAdapter
+
+    assert LLMAdapter._model_chain("", "only") == ["only"]
+
+
+def test_default_gemini_and_groq_chains_are_configured() -> None:
+    """A chain of one model is not a chain — it silently disables the feature."""
+    from app.core.config import settings
+
+    gemini = [m for m in str(settings.gemini_models).split(",") if m.strip()]
+    groq = [m for m in str(settings.groq_models).split(",") if m.strip()]
+    assert len(gemini) > 1, "Gemini should have more than one candidate model"
+    assert len(groq) > 1, "Groq should have more than one candidate model"
+    assert settings.gemini_model in gemini
+    assert settings.groq_model in groq
+
+
+def test_a_non_retryable_error_stops_the_chain() -> None:
+    """Advancing on a malformed request would multiply latency for nothing and bury the
+    real cause behind a pile of identical failures."""
+    from app.llm.adapter import LLMAdapter
+    from app.llm.base import LLMError
+
+    calls: list[str] = []
+
+    class Fake:
+        def __init__(self, model=None):
+            self.model = model
+            self.configured = True
+
+        async def generate(self, messages, *, temperature=None, max_tokens=None):
+            calls.append(self.model)
+
+            raise LLMError("bad request", retryable=False)
+
+    adapter = LLMAdapter()
+    try:
+        import asyncio
+
+        asyncio.run(
+            adapter._generate_with_model_chain(
+                Fake, "m1,m2,m3", "m1", [], None, None, provider_name="Fake"
+            )
+        )
+    except LLMError:
+        pass
+    assert calls == ["m1"], "must not try further models on a non-retryable failure"
+
+
+def test_a_retryable_error_advances_the_chain() -> None:
+    from app.llm.adapter import LLMAdapter
+    from app.llm.base import RateLimitedError
+
+    class Fake:
+        def __init__(self, model=None):
+            self.model = model
+            self.configured = True
+
+        async def generate(self, messages, *, temperature=None, max_tokens=None):
+            if self.model != "good":
+                raise RateLimitedError("rate limited")
+            from app.llm.base import LLMResponse
+
+            return LLMResponse(text="ok", model=self.model, provider="fake")
+
+    adapter = LLMAdapter()
+    import asyncio
+
+    response, skipped = asyncio.run(
+        adapter._generate_with_model_chain(
+            Fake, "busy1,busy2,good", "busy1", [], None, None, provider_name="Fake"
+        )
+    )
+    assert response.model == "good"
+    assert len(skipped) == 2
+
+
+def test_the_successful_model_is_reported() -> None:
+    """A silent swap to a weaker model would make answer quality impossible to reason
+    about. The skipped ones must come back with the response."""
+    from app.llm.adapter import LLMAdapter
+    from app.llm.base import LLMError, ProviderUnavailableError
+
+    class Fake:
+        def __init__(self, model=None):
+            self.model = model
+            self.configured = True
+
+        async def generate(self, messages, *, temperature=None, max_tokens=None):
+            if self.model == "third":
+                from app.llm.base import LLMResponse
+
+                return LLMResponse(text="ok", model=self.model, provider="fake")
+            raise ProviderUnavailableError("down")
+
+    import asyncio
+
+    adapter = LLMAdapter()
+    response, skipped = asyncio.run(
+        adapter._generate_with_model_chain(
+            Fake, "first,second,third", "first", [], None, None, provider_name="Fake"
+        )
+    )
+    assert response.model == "third"
+    assert any("first" in entry for entry in skipped)
+    assert any("second" in entry for entry in skipped)
+
+
+def test_chain_reports_when_nothing_worked() -> None:
+    from app.llm.adapter import LLMAdapter
+    from app.llm.base import LLMError, ProviderUnavailableError
+
+    class Fake:
+        def __init__(self, model=None):
+            self.model = model
+            self.configured = True
+
+        async def generate(self, messages, *, temperature=None, max_tokens=None):
+            raise ProviderUnavailableError("all down")
+
+    import asyncio
+
+    adapter = LLMAdapter()
+    with pytest.raises(LLMError):
+        asyncio.run(
+            adapter._generate_with_model_chain(
+                Fake, "a,b", "a", [], None, None, provider_name="Fake"
+            )
+        )
+
+
+def test_unconfigured_provider_short_circuits() -> None:
+    from app.llm.adapter import LLMAdapter
+    from app.llm.base import LLMError
+
+    calls: list[str] = []
+
+    class Fake:
+        def __init__(self, model=None):
+            self.model = model
+            # Not configured: never attempt a request at all.
+
+            @property
+            def configured(self_inner):
+                return False
+
+            self.configured = False
+
+        async def generate(self, messages, *, temperature=None, max_tokens=None):
+            calls.append(self.model)
+            raise AssertionError("must not call generate when unconfigured")
+
+    import asyncio
+
+    adapter = LLMAdapter()
+    with pytest.raises(LLMError):
+        asyncio.run(
+            adapter._generate_with_model_chain(
+                Fake, "a,b", "a", [], None, None, provider_name="Fake"
+            )
+        )
+    assert calls == []
+
+
+def test_configured_model_is_first_even_when_listed_later() -> None:
+    """Regression: the old code only inserted the configured model when it was ABSENT from
+    the raw list. If the operator picked a model that already appeared later in the chain,
+    it was tried SECOND, and the first-listed model was tried first.
+
+    With gemini_model=gemini-3.5-flash and a chain starting gemini-2.5-flash, the old code
+    attempted 2.5-flash first, wasting a request on a model the operator did not choose.
+    """
+
+    from app.llm.adapter import LLMAdapter
+
+    assert LLMAdapter._model_chain("a,zz,c", "zz") == ["zz", "a", "c"]
+    assert LLMAdapter._model_chain("a,b,c", "zz") == ["zz", "a", "b", "c"]
+
+    assert LLMAdapter._model_chain("gemini-2.5-flash,gemini-3.5-flash", "gemini-3.5-flash") == [
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]
+
+
+def test_chain_without_a_configured_model_keeps_its_order() -> None:
+    """No fallback means no reordering. The chain is used exactly as written.
+
+    The chain must not reorder itself when there is no operator choice to honour.
+
+    """
+
+    from app.llm.adapter import LLMAdapter
+
+    assert LLMAdapter._model_chain("a,b,c", "") == ["a", "b", "c"]
+
+
+def test_empty_chain_falls_back_to_the_configured_model() -> None:
+    """A blank chain must not produce an empty list, which would silently generate nothing.
+
+    """
+    from app.llm.adapter import LLMAdapter
+
+    assert LLMAdapter._model_chain("", "only") == ["only"]
+    assert LLMAdapter._model_chain("   ", "only") == ["only"]
+
+
+def test_no_models_at_all_returns_empty() -> None:
+    """Nothing configured means nothing to try; the caller surfaces it as an error.
+    """
+
+    from app.llm.adapter import LLMAdapter
+
+    assert LLMAdapter._model_chain("", "") == []
+
+
+def test_chain_moves_configured_model_to_front_removing_later_duplicate() -> None:
+    """The configured model must appear exactly once, at the front.
+
+    If it appeared twice, we would attempt the same model twice.
+    """
+
+    from app.llm.adapter import LLMAdapter
+
+    result = LLMAdapter._model_chain("a,zz,b,zz", "zz")
+    assert result == ["zz", "a", "b"]
+    assert result.count("zz") == 1
+
+
+def test_real_settings_produce_a_valid_chain() -> None:
+    """Guard the shipped defaults against the ordering bug.
+
+    The configured Gemini model must be attempted first — before any other.
+
+    """
+
+    from app.core.config import settings
+
+    from app.llm.adapter import LLMAdapter
+    from app.core.config import settings
+
+    gemini = LLMAdapter._model_chain(settings.gemini_models, settings.gemini_model)
+    groq = LLMAdapter._model_chain(settings.groq_models, settings.groq_model)
+
+    assert gemini[0] == settings.gemini_model
+    assert groq[0] == settings.groq_model
+    assert len(set(gemini)) == len(gemini)
+    assert len(set(groq)) == len(groq)
+
+

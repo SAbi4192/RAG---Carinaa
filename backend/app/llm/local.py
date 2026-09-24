@@ -42,10 +42,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -311,6 +312,81 @@ class LocalProvider:
     async def list_models(self) -> list[str]:
         """The local model is whatever file is on disk. There is no registry."""
         return [settings.local_model_label] if self.model_present else []
+
+    # --------------------------------------------------------------- streaming
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield real token deltas from llama.cpp, order-preserving.
+
+        llama.cpp's iterator is a BLOCKING Python generator, so it runs in a worker
+        thread and hands fragments to the event loop through a queue. Two guarantees
+        hold: the lock is held for the whole generation (a llama.cpp context is
+        single-state, so two concurrent streams would corrupt the KV cache), and no
+        network call is made - the offline guarantee applies to streaming too.
+        """
+        if not self.load():
+            raise LLMError(
+                "The local model is not available, so Offline mode cannot generate an "
+                "answer. Check that models/llm-model.gguf exists and that "
+                "llama-cpp-python is installed.",
+                retryable=False,
+            )
+
+        temperature = settings.local_temperature if temperature is None else temperature
+        max_tokens = max_tokens or settings.local_max_tokens
+
+        approx_prompt_tokens = sum(len(m.get("content", "")) for m in messages) // 4
+        if approx_prompt_tokens > self.n_ctx - max_tokens - 64:
+            raise LLMError(
+                f"The retrieved context is too large for the local model's {self.n_ctx}-token "
+                f"window (~{approx_prompt_tokens} tokens of prompt). Reduce Top-K or the "
+                f"context budget, or raise LOCAL_N_CTX.",
+                retryable=False,
+            )
+
+        fragments: queue.Queue[Any] = queue.Queue()
+        sentinel = object()
+
+        def produce() -> None:
+            try:
+                with self._lock:
+                    for chunk in self._llm.create_chat_completion(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=settings.local_top_p,
+                        repeat_penalty=settings.local_repeat_penalty,
+                        stream=True,
+                    ):
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = (choices[0].get("delta") or {}).get("content")
+                        if delta:
+                            fragments.put(str(delta))
+                fragments.put(sentinel)
+            except Exception as exc:  # noqa: BLE001 - re-raised in the consumer
+                fragments.put(exc)
+
+        thread = threading.Thread(target=produce, name="carinaa-local-stream", daemon=True)
+        thread.start()
+
+        while True:
+            item = await asyncio.to_thread(fragments.get)
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                logger.exception("Local streaming failed", exc_info=item)
+                raise LLMError(
+                    "The local model failed while generating an answer.",
+                    retryable=False,
+                ) from item
+            yield item
 
     # ------------------------------------------------------------------- info
     def info(self) -> dict[str, Any]:

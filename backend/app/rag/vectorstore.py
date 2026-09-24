@@ -92,6 +92,11 @@ class RetrievedChunk:
     document_name: str = ""
     file_type: str = ""
 
+    # The score the vector search alone produced, before any lexical blending.
+    # Kept so the trace can show what retrieval believed independently of the
+    # adjustment - the blend is an amendment, never a replacement.
+    original_score: float | None = None
+
     def citation_label(self) -> str:
         """Short human label, e.g. 'Cloud_Computing.pdf p.32'."""
         parts = [self.document_name or f"Document {self.document_id}"]

@@ -18,6 +18,20 @@ import type { AskResponse } from "@/lib/types";
  * The workspace id is passed in rather than read from storage, so the caller's
  * workspace context stays the single source of truth.
  */
+/**
+ * Optional knobs for one experiment run.
+ *
+ * Both are strictly opt-in: when omitted the request is a plain
+ * document-grounded question, exactly as before, so every lab that shares this
+ * hook keeps its current behaviour.
+ */
+export interface AskRunOptions {
+  /** Add labelled web results alongside the documents (online mode only). */
+  use_web_search?: boolean;
+  /** Restrict retrieval to these documents; omit/empty = whole workspace. */
+  document_ids?: number[];
+}
+
 export interface AskRun {
   question: string;
   answer: string;
@@ -25,7 +39,11 @@ export interface AskRun {
   result: AskResponse | null;
   running: boolean;
   error: string;
-  run: (question: string, mode: "online" | "offline") => Promise<void>;
+  run: (
+    question: string,
+    mode: "online" | "offline",
+    options?: AskRunOptions,
+  ) => Promise<void>;
   reset: () => void;
 }
 
@@ -37,7 +55,11 @@ export function useAskRun(workspaceId: number | null): AskRun {
   const [mode, setMode] = useState<"online" | "offline">("online");
 
   const run = useCallback(
-    async (nextQuestion: string, nextMode: "online" | "offline") => {
+    async (
+      nextQuestion: string,
+      nextMode: "online" | "offline",
+      options?: AskRunOptions,
+    ) => {
       const trimmed = nextQuestion.trim();
       if (!trimmed) return;
       if (!workspaceId) {
@@ -56,6 +78,14 @@ export function useAskRun(workspaceId: number | null): AskRun {
           workspace_id: workspaceId,
           mode: nextMode,
           language: "en",
+          // Web search is request-scoped and never enabled implicitly: it is
+          // only sent when the experiment explicitly asked for it, and never
+          // in offline mode (the server would refuse it anyway).
+          use_web_search:
+            options?.use_web_search && nextMode === "online" ? true : false,
+          document_ids: options?.document_ids?.length
+            ? options.document_ids
+            : undefined,
         });
         setResult(response);
       } catch (cause) {

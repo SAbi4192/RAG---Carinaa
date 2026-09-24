@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { NavLink, useLocation } from "react-router-dom";
+import { Link, NavLink, useLocation } from "react-router-dom";
 import {
   Activity,
   BarChart3,
@@ -9,6 +9,7 @@ import {
   FlaskConical,
   GraduationCap,
   LayoutDashboard,
+  Lightbulb,
   Menu,
   MessagesSquare,
   Moon,
@@ -26,8 +27,10 @@ import { useTheme } from "@/state/theme";
 import { useWorkspaces } from "@/state/workspace";
 import { Logo, LogoMark } from "@/components/brand/Logo";
 import { Button } from "@/components/ui/Button";
+import { Modal } from "@/components/ui/Modal";
 import { StatusDot } from "@/components/ui/Badge";
 import { WorkspaceSwitcher } from "@/components/layout/WorkspaceSwitcher";
+import { RagWorkflow } from "@/components/rag/RagWorkflow";
 
 /**
  * The application shell.
@@ -135,6 +138,8 @@ function SidebarContent({
   const { active } = useWorkspaces();
   const location = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
+  /** The lightweight first-visit introduction - a modal, never a wall of text. */
+  const [howOpen, setHowOpen] = useState(false);
 
   const isActive = (item: NavItem) => {
     // A shortcut is never "the page you are on" - it is a way to get somewhere.
@@ -257,6 +262,67 @@ function SidebarContent({
             </div>
           )
         ) : null}
+
+        <button
+          type="button"
+          onClick={() => setHowOpen(true)}
+          title={collapsed ? "How Carinaa works" : undefined}
+          className={cn(
+            "flex w-full items-center rounded-lg py-2 text-xs font-medium text-muted transition-colors hover:bg-sunken hover:text-ink",
+            collapsed ? "justify-center px-0" : "gap-2.5 px-2.5",
+          )}
+        >
+          <Lightbulb className="h-4 w-4 text-faint" />
+          {collapsed ? (
+            <span className="sr-only">How Carinaa works</span>
+          ) : (
+            "How Carinaa works"
+          )}
+        </button>
+
+        <Modal
+          open={howOpen}
+          onClose={() => setHowOpen(false)}
+          title="How Carinaa works"
+          description="Carinaa is an AI chatbot that can answer using your own documents."
+          size="lg"
+        >
+          <div className="space-y-4">
+            <div className="rounded-xl border border-brand/25 bg-brand/6 p-4">
+              <p className="text-xs leading-relaxed text-ink">
+                When you ask a question, Carinaa does not just answer from memory. It:
+              </p>
+              <ol className="mt-2 list-inside list-decimal space-y-1 text-xs leading-relaxed text-muted">
+                <li>Searches your knowledge.</li>
+                <li>Finds the useful information.</li>
+                <li>Gives that information to the AI.</li>
+                <li>Checks the answer against it.</li>
+              </ol>
+              <p className="mt-2.5 text-xs font-semibold text-ink">
+                That&apos;s Retrieval-Augmented Generation (RAG).
+              </p>
+            </div>
+
+            <RagWorkflow />
+
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-line bg-sunken px-4 py-3">
+              <p className="min-w-0 text-2xs leading-relaxed text-muted">
+                Want to watch it happen for your own question? Learning Mode shows the
+                steps behind each answer.
+              </p>
+              <Link
+                to="/app/learning"
+                onClick={() => {
+                  setHowOpen(false);
+                  onNavigate?.();
+                }}
+                className="shrink-0 rounded-lg border border-brand/40 bg-brand/10 px-3 py-1.5 text-2xs font-medium text-brand transition hover:bg-brand/15"
+              >
+                Open Learning Mode →
+              </Link>
+            </div>
+          </div>
+        </Modal>
 
         <button
           type="button"

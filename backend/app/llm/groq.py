@@ -1,16 +1,17 @@
 """
-Groq provider (fallback, online).
+Groq provider (primary, online).
 
 API shape:  POST {base}/chat/completions   (OpenAI-compatible)
 Docs:       https://console.groq.com/docs/models
 
-WHY GROQ IS THE FALLBACK
-------------------------
+WHY GROQ IS PRIMARY
+-------------------
 It is OpenAI-API-compatible, extremely fast (LPU inference), and its production
-model line is stable. When Gemini is rate-limited or down, the user still gets an
-answer - and the UI says so, explicitly:
+model line is stable - which makes it the right provider for live demos, where
+latency IS the user experience. When Groq is rate-limited or down, the adapter
+falls back to Gemini, and the UI says so, explicitly:
 
-    "Groq · Fallback"
+    "Gemini · Fallback"
 
 We never present a fallback answer as if the primary provider produced it. A
 silently hidden fallback would mean the user cannot reason about which model wrote
@@ -19,7 +20,8 @@ what, which matters when you are citing documents.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -34,6 +36,7 @@ from app.llm.base import (
     RateLimitedError,
     Stopwatch,
     is_truncated,
+    iter_sse_data,
 )
 
 logger = get_logger(__name__)
@@ -42,7 +45,7 @@ logger = get_logger(__name__)
 class GroqProvider:
     name = "groq"
     label = "Groq"
-    role = "fallback"
+    role = "primary"
 
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         self.api_key = (api_key if api_key is not None else settings.groq_api_key).strip()
@@ -109,9 +112,13 @@ class GroqProvider:
                 "Groq rejected our credentials. Check that GROQ_API_KEY is valid."
             )
         if response.status_code == 404:
+            # RETRYABLE, same reasoning as Gemini: one unknown model says nothing about the
+            # rest of the chain. See the note in gemini.py.
             raise LLMError(
                 f"Groq does not recognise the model '{self.model}'. Pick a current model "
-                f"on the Settings page."
+                f"on the Settings page.",
+                retryable=True,
+                status_code=404,
             )
         if response.status_code >= 500:
             raise ProviderUnavailableError(f"Groq returned HTTP {response.status_code}.")
@@ -161,6 +168,78 @@ class GroqProvider:
             },
             finish_reason=finish_reason,
         )
+
+    # --------------------------------------------------------------- streaming
+    async def stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        """Yield Groq's real token deltas, OpenAI-style.
+
+        Raises the SAME errors as `generate` so the adapter's fallback rules apply
+        identically to a streaming request. That matters: a rate-limited stream must
+        advance the chain exactly as a rate-limited completion does.
+        """
+        if not self.configured:
+            raise ProviderConfigError("Groq is not configured (GROQ_API_KEY missing).")
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": settings.groq_temperature if temperature is None else temperature,
+            "max_tokens": max_tokens or settings.groq_max_output_tokens,
+            "stream": True,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ) as response:
+                    if response.status_code == 429:
+                        raise RateLimitedError("Groq is rate limiting us.")
+                    if response.status_code in (401, 403):
+                        raise ProviderConfigError(
+                            "Groq rejected our credentials. Check that GROQ_API_KEY is valid."
+                        )
+                    if response.status_code == 404:
+                        raise LLMError(
+                            f"Groq does not recognise the model '{self.model}'. Pick a current "
+                            f"model on the Settings page.",
+                            retryable=True,
+                            status_code=404,
+                        )
+                    if response.status_code >= 500:
+                        raise ProviderUnavailableError(
+                            f"Groq returned HTTP {response.status_code}."
+                        )
+                    if response.status_code != 200:
+                        raise LLMError(f"Groq returned HTTP {response.status_code}.")
+
+                    async for data in iter_sse_data(response.aiter_lines()):
+                        try:
+                            event = json.loads(data)
+                        except ValueError:
+                            continue
+                        for choice in event.get("choices") or []:
+                            delta = (choice.get("delta") or {}).get("content")
+                            if delta:
+                                yield str(delta)
+        except httpx.TimeoutException as exc:
+            raise ProviderUnavailableError("Groq timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                f"Could not reach Groq ({exc.__class__.__name__})."
+            ) from exc
 
     # --------------------------------------------------------------- model list
     async def list_models(self) -> list[str]:

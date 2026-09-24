@@ -17,6 +17,23 @@ export function isMissing(value: unknown): boolean {
   return value === null || value === undefined || value === "" || Number.isNaN(value);
 }
 
+/**
+ * Parse an ISO timestamp from the API.
+ *
+ * The models store timezone-aware UTC, but SQLite drops the offset when a row is
+ * read back, so the API can emit "2026-09-22T10:04:11" with no suffix. The
+ * JavaScript `new Date()` reads a suffix-less ISO string as LOCAL time, which
+ * shifted every timestamp by the user's UTC offset - the cause of a conversation
+ * created minutes ago being labelled "6 hours ago". A missing suffix means UTC.
+ */
+export function parseApiDate(iso: string | null | undefined): Date | null {
+  if (isMissing(iso)) return null;
+  let text = String(iso).trim();
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(text)) text += "Z";
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 /** `—` for missing values, otherwise the formatted number. */
 export function formatNumber(value: number | null | undefined, digits = 0): string {
   if (isMissing(value)) return EM_DASH;
@@ -83,9 +100,8 @@ export function formatDuration(ms: number | null | undefined): string {
 }
 
 export function formatDate(iso: string | null | undefined): string {
-  if (isMissing(iso)) return EM_DASH;
-  const date = new Date(String(iso));
-  if (Number.isNaN(date.getTime())) return EM_DASH;
+  const date = parseApiDate(iso);
+  if (!date) return EM_DASH;
   return date.toLocaleDateString(undefined, {
     year: "numeric",
     month: "short",
@@ -94,9 +110,8 @@ export function formatDate(iso: string | null | undefined): string {
 }
 
 export function formatDateTime(iso: string | null | undefined): string {
-  if (isMissing(iso)) return EM_DASH;
-  const date = new Date(String(iso));
-  if (Number.isNaN(date.getTime())) return EM_DASH;
+  const date = parseApiDate(iso);
+  if (!date) return EM_DASH;
   return date.toLocaleString(undefined, {
     year: "numeric",
     month: "short",
@@ -106,16 +121,25 @@ export function formatDateTime(iso: string | null | undefined): string {
   });
 }
 
+/** "14:32" - the wall-clock time of a message, in the user's own timezone. */
+export function formatTimeOfDay(iso: string | null | undefined): string {
+  const date = parseApiDate(iso);
+  if (!date) return EM_DASH;
+  return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
 /**
  * "3 minutes ago".
  *
  * Intl.RelativeTimeFormat does the localisation properly, including pluralisation
  * in languages we have not thought about, so we delegate rather than hand-roll it.
+ * The timestamp is parsed with `parseApiDate`, so a naive UTC string from the API
+ * is never mistaken for local time.
  */
 export function formatRelative(iso: string | null | undefined): string {
-  if (isMissing(iso)) return EM_DASH;
-  const then = new Date(String(iso)).getTime();
-  if (Number.isNaN(then)) return EM_DASH;
+  const date = parseApiDate(iso);
+  if (!date) return EM_DASH;
+  const then = date.getTime();
 
   const seconds = Math.round((then - Date.now()) / 1000);
   const abs = Math.abs(seconds);

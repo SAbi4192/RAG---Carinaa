@@ -58,6 +58,8 @@ from app.db.models import Chunk
 from app.rag.embeddings import get_embedding_service
 from app.rag.reranker import get_reranker
 from app.rag.trace import TraceRecorder
+# units has no dependency on the retriever, so this cannot create a cycle.
+from app.rag.units import detect_unit_reference
 from app.rag.vectorstore import RetrievedChunk, get_vector_store
 
 logger = get_logger(__name__)
@@ -334,6 +336,15 @@ class Retriever:
             candidates = [c for c in candidates if c.score >= threshold]
             outcome.below_threshold = before - len(candidates)
 
+        # Blend in a lexical term BEFORE the final cut, so a chunk that literally
+        # contains "UNIT III" is not discarded for a weak semantic score.
+        #
+        # Called ONCE. It was previously called twice in a row, which re-scored every
+        # candidate against the same question a second time - the blend is not
+        # idempotent, so the second pass silently shifted every score again and the
+        # ranking shown in the trace was not the ranking the first pass produced.
+        candidates = apply_lexical_blend(candidates, question)
+
         if trace:
             trace.add(
                 "candidate_retrieval",
@@ -343,6 +354,7 @@ class Retriever:
                     "duplicates_removed": duplicates,
                     "below_threshold_removed": outcome.below_threshold,
                     "score_threshold": threshold,
+                    "lexical_blend": True,
                     "near_duplicate_threshold": settings.retrieval_near_duplicate_threshold,
                     "top_score": round(candidates[0].score, 4) if candidates else 0.0,
                     "bottom_score": round(candidates[-1].score, 4) if candidates else 0.0,
@@ -580,6 +592,164 @@ class Retriever:
 # chunk is essentially a copy of, or a fragment of, the longer one.
 _MIN_CONTAINMENT = 0.92
 _MIN_SHARED_WORDS = 6
+
+
+_LEXICAL_STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with", "using",
+    "is", "are", "was", "were", "be", "what", "which", "who", "when", "where",
+    "tell", "me", "about", "explain", "describe", "summarize", "summarise",
+    "give", "show", "list", "does", "do", "did", "say", "says", "please", "can",
+    "you", "your", "this", "that", "these", "those", "it", "its", "from", "at",
+    "by", "as", "how", "why", "name",
+}
+
+
+def _query_terms(query: str) -> set[str]:
+    """Significant lowercase words from the query."""
+    words = re.findall(r"[a-z0-9]+", (query or "").lower())
+    return {word for word in words if len(word) > 1 and word not in _LEXICAL_STOPWORDS}
+
+
+def _lexical_score(query_terms: set[str], chunk: RetrievedChunk) -> float:
+    """Fraction of the query's significant terms that appear literally.
+
+    Searched as a substring across the chunk's TEXT and its SECTION TITLE, because the
+    distinctive token is often only in the heading: "iii" appears in
+    "UNIT III - CONCEPT GENERATION" and may not recur in every sentence beneath it. A
+    token-set intersection would fragment multi-word strings like "UNIT III" anyway.
+    """
+    if not query_terms:
+        return 0.0
+
+    section = str((chunk.metadata or {}).get("section") or "")
+    haystack = f"{section} {chunk.content}".lower()
+    if not haystack.strip():
+        return 0.0
+
+    hits = sum(1 for term in query_terms if term in haystack)
+    return hits / len(query_terms)
+
+
+def apply_lexical_blend(
+    candidates: list[RetrievedChunk], query: str, weight: float | None = None
+) -> list[RetrievedChunk]:
+    """Blend a lexical term into each candidate's score, then re-sort.
+
+    WEIGHT IS ADAPTIVE, and that is the whole point.
+
+    A flat weight cannot serve both kinds of question:
+      - "What is the name of UNIT III?" is a STRING question. The embedding barely
+        distinguishes UNIT I from UNIT III, so the semantic gap is noise and lexical
+        evidence must dominate.
+      - "How does virtualisation save money?" is a MEANING question, where lexical
+        overlap is nearly irrelevant and must stay subordinate.
+
+    Too high breaks paraphrasing; too low fails exact references. So the weight rises
+    only when the query actually names a structural reference.
+
+    The pre-blend score is kept on `original_score`, so the trace can still show what
+    retrieval believed on its own - the blend amends, it does not replace.
+    """
+    if not candidates or not query:
+        return candidates
+
+    terms = _query_terms(query)
+    if not terms:
+        return candidates
+
+    if weight is None:
+        number, _roman, _phrase = detect_unit_reference(query)
+        weight = 0.55 if number else 0.15
+
+    for chunk in candidates:
+        if chunk.original_score is None:
+            chunk.original_score = chunk.score
+        chunk.score = round(
+            (1.0 - weight) * chunk.original_score + weight * _lexical_score(terms, chunk),
+            4,
+        )
+
+    candidates.sort(key=lambda chunk: chunk.score, reverse=True)
+    return candidates
+
+
+_LEXICAL_STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "with", "using",
+    "is", "are", "was", "were", "be", "what", "which", "who", "when", "where",
+    "tell", "me", "about", "explain", "describe", "summarize", "summarise",
+    "give", "show", "list", "does", "do", "did", "say", "says", "please", "can",
+    "you", "your", "this", "that", "these", "those", "it", "its", "from", "at",
+    "by", "as", "how", "why", "name",
+}
+
+
+def _query_terms(query: str) -> set[str]:
+    """Significant lowercase words from the query."""
+    words = re.findall(r"[a-z0-9]+", (query or "").lower())
+    return {word for word in words if len(word) > 1 and word not in _LEXICAL_STOPWORDS}
+
+
+def _lexical_score(query_terms: set[str], chunk: RetrievedChunk) -> float:
+    """Fraction of the query's significant terms that appear literally.
+
+    Searched as a substring across the chunk's TEXT and its SECTION TITLE, because the
+    distinctive token is often only in the heading: "iii" appears in
+    "UNIT III - CONCEPT GENERATION" and may not recur in every sentence beneath it. A
+    token-set intersection would fragment multi-word strings like "UNIT III" anyway.
+    """
+    if not query_terms:
+        return 0.0
+
+    section = str((chunk.metadata or {}).get("section") or "")
+    haystack = f"{section} {chunk.content}".lower()
+    if not haystack.strip():
+        return 0.0
+
+    hits = sum(1 for term in query_terms if term in haystack)
+    return hits / len(query_terms)
+
+
+def apply_lexical_blend(
+    candidates: list[RetrievedChunk], query: str, weight: float | None = None
+) -> list[RetrievedChunk]:
+    """Blend a lexical term into each candidate's score, then re-sort.
+
+    WEIGHT IS ADAPTIVE, and that is the whole point.
+
+    A flat weight cannot serve both kinds of question:
+      - "What is the name of UNIT III?" is a STRING question. The embedding barely
+        distinguishes UNIT I from UNIT III, so the semantic gap is noise and lexical
+        evidence must dominate.
+      - "How does virtualisation save money?" is a MEANING question, where lexical
+        overlap is nearly irrelevant and must stay subordinate.
+
+    Too high breaks paraphrasing; too low fails exact references. So the weight rises
+    only when the query actually names a structural reference.
+
+    The pre-blend score is kept on `original_score`, so the trace can still show what
+    retrieval believed on its own - the blend amends, it does not replace.
+    """
+    if not candidates or not query:
+        return candidates
+
+    terms = _query_terms(query)
+    if not terms:
+        return candidates
+
+    if weight is None:
+        number, _roman, _phrase = detect_unit_reference(query)
+        weight = 0.55 if number else 0.15
+
+    for chunk in candidates:
+        if chunk.original_score is None:
+            chunk.original_score = chunk.score
+        chunk.score = round(
+            (1.0 - weight) * chunk.original_score + weight * _lexical_score(terms, chunk),
+            4,
+        )
+
+    candidates.sort(key=lambda chunk: chunk.score, reverse=True)
+    return candidates
 
 
 def _content_word_set(text: str) -> frozenset[str]:

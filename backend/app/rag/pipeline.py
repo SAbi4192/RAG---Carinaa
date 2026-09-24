@@ -43,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -151,12 +151,221 @@ class RAGAnswer:
         return self.provider.title() if self.provider else "Unknown"
 
 
+@dataclass
+class _Prepared:
+    """Everything retrieval and context building produced, before generation.
+
+    Shared by `answer` and `stream_answer` so the two paths cannot drift: whatever
+    question rewriting, filtering, retrieval and context the non-streaming answer
+    performs, the streaming answer performs identically.
+    """
+
+    retrieval: RetrievalOutcome
+    bundle: ContextBundle
+    prompt_excerpts: list[dict[str, Any]]
+    evidence_excerpts: list[dict[str, Any]]
+    resolved_question: str
+    followup_detected: bool
+    rewrite_note: str
+    unit_note: str
+
+
 class RAGPipeline:
     """Runs one question through the whole pipeline."""
 
     def __init__(self) -> None:
         self.retriever = get_retriever()
         self.adapter = get_llm_adapter()
+
+    # =====================================================================
+    # Shared retrieval + context preparation
+    # =====================================================================
+    async def _prepare(
+        self,
+        db: Session,
+        *,
+        workspace_id: int,
+        question: str,
+        result: RAGAnswer,
+        mode: str,
+        top_k: int | None,
+        candidate_k: int | None,
+        document_ids: Sequence[int] | None,
+        use_rerank: bool | None,
+        trace: TraceRecorder,
+        history: list[dict[str, str]] | None,
+        page_number: int | None,
+        section: str | None,
+    ) -> _Prepared:
+        """Understand the question, retrieve, and build the context bundle.
+
+        The two entry points (`answer`, `stream_answer`) both call this, so the
+        evidence fed to the model is identical whichever way it is generated.
+        """
+        # A follow-up like "what is my name?" or "explain the second one" cannot be
+        # answered, or even retrieved for, in isolation. This resolves it into a
+        # standalone question using the conversation.
+        resolved_question = question
+        rewrite_note = ""
+        followup_detected = bool(
+            history and needs_conversation_context(question, len(history))
+        )
+        if followup_detected and mode == "online":
+            try:
+                rewrite_response = await self.adapter.generate(
+                    build_rewrite_messages(question, history),
+                    mode=mode,
+                    temperature=0.0,
+                    max_tokens=80,
+                )
+                candidate = clean_rewrite(rewrite_response.text, question)
+                if candidate and candidate.strip() != question.strip():
+                    resolved_question = candidate
+                    rewrite_note = "Question rewritten using the conversation."
+            except Exception as exc:  # noqa: BLE001 - a failed rewrite is not fatal
+                logger.warning("Query rewrite skipped: %s", exc.__class__.__name__)
+
+        unit_note = ""
+        if resolved_question:
+            expanded, unit_note = expand_unit_reference(resolved_question)
+            if unit_note:
+                resolved_question = expanded
+
+        if resolved_question != question:
+            result.question = resolved_question
+
+        # ------------------------------------------------------------- retrieval
+        try:
+            retrieval: RetrievalOutcome = await asyncio.to_thread(
+                self.retriever.retrieve,
+                db,
+                workspace_id=workspace_id,
+                question=resolved_question,
+                top_k=top_k,
+                candidate_k=candidate_k,
+                page_number=page_number,
+                section=section,
+                document_ids=document_ids,
+                use_rerank=use_rerank,
+                trace=trace,
+            )
+        except CarinaaError as exc:
+            result.error = exc.message
+            result.error_code = exc.code
+            raise
+
+        result.retrieval = retrieval
+
+        # ------------------------------------------------------ context building
+        with trace.stage("context_building") as info:
+            bundle = build_context(retrieval.chunks)
+            stats = context_stats(bundle)
+            info.update(stats)
+        result.context = bundle
+
+        # Two views of the SAME evidence, and the difference matters: the prompt
+        # list is minimal for the model, the evidence list carries provenance that
+        # citation resolution and grounding need. See the long note in git history.
+        prompt_excerpts = bundle.as_prompt_list()
+        evidence_excerpts = bundle.as_dict()["excerpts"]
+
+        return _Prepared(
+            retrieval=retrieval,
+            bundle=bundle,
+            prompt_excerpts=prompt_excerpts,
+            evidence_excerpts=evidence_excerpts,
+            resolved_question=resolved_question,
+            followup_detected=followup_detected,
+            rewrite_note=rewrite_note,
+            unit_note=unit_note,
+        )
+
+    def _finalize(
+        self,
+        result: RAGAnswer,
+        prepared: _Prepared,
+        *,
+        question: str,
+        web_sources: list[dict[str, Any]] | None,
+        started: float,
+    ) -> None:
+        """Marker normalisation, citation resolution, grounding, trace annotation.
+
+        Runs identically after a buffered or a streamed completion: the SAME text
+        is cited and grounded, so a streamed answer is not a second-class one.
+        """
+        # Providers disagree about citation brackets (ASCII "[1]" vs the full-width
+        # CJK form). Canonicalise once so the stored answer, its citations, the
+        # trace, read-aloud and the validators all read one form.
+        normalized_answer = normalize_citation_markers(result.answer)
+        if normalized_answer != result.answer:
+            logger.info("Normalised non-ASCII citation brackets in the generated answer.")
+            result.answer = normalized_answer
+
+        evidence_excerpts = prepared.evidence_excerpts
+
+        with result.trace.stage("citation_resolution") as info:  # type: ignore[union-attr]
+            citation_report = resolve_citations(
+                result.answer, evidence_excerpts, web_sources=web_sources
+            )
+            info.update(
+                {
+                    "citations_found": len(citation_report.citations),
+                    "cited_numbers": citation_report.cited_numbers,
+                    "invalid_numbers": citation_report.invalid_numbers,
+                    "unused_excerpts": citation_report.unused_numbers,
+                    "valid": citation_report.valid,
+                }
+            )
+        result.citations = citation_report
+
+        with result.trace.stage("grounding") as info:  # type: ignore[union-attr]
+            grounding = check_grounding(
+                result.answer,
+                evidence_excerpts,
+                citation_report,
+                top_score=prepared.retrieval.top_score,
+            )
+            info.update(
+                {
+                    "status": grounding.status,
+                    "refused": grounding.refused,
+                    "supported_sentences": grounding.supported_count,
+                    "weak_sentences": grounding.weak_count,
+                    "uncited_sentences": grounding.uncited_count,
+                    "checks": {
+                        name: check.get("passed")
+                        for name, check in grounding.checks.items()
+                    },
+                }
+            )
+        result.grounding = grounding
+
+        # Annotate the trace once the run is complete. This has to happen HERE:
+        # `query_analysis` is recorded during retrieval, so writing to it before the
+        # pipeline ran silently did nothing.
+        understanding_notes: dict[str, Any] = {}
+        if prepared.followup_detected:
+            understanding_notes.update(
+                {
+                    "original_question": question,
+                    "resolved_question": prepared.resolved_question,
+                    "is_followup": True,
+                    "rewrite_reason": prepared.rewrite_note
+                    or "The question needed the conversation; it was already "
+                    "self-contained so the wording was left unchanged.",
+                }
+            )
+        if prepared.unit_note:
+            understanding_notes["unit_reference"] = prepared.unit_note
+
+        if understanding_notes and result.trace:
+            for event in result.trace.events:
+                if event.stage == "query_analysis":
+                    event.data.update(understanding_notes)
+                    break
+
+        result.total_ms = int((time.perf_counter() - started) * 1000)
 
     async def answer(
         self,
@@ -182,109 +391,21 @@ class RAGPipeline:
         trace = trace or TraceRecorder()
         result = RAGAnswer(question=question, answer="", mode=mode, trace=trace)
 
-        # =================================================================
-        # UNDERSTANDING  (before retrieval - it changes what we search for)
-        # =================================================================
-        # A follow-up like "what is my name?" or "explain the second one" cannot be
-        # answered, or even retrieved for, in isolation. This resolves it into a
-        # standalone question using the conversation.
-        #
-        # Retrieval uses the RESOLVED question; generation uses the ORIGINAL one
-        # plus the history. That way retrieval searches for something complete,
-        # while the answer is written from what the user actually typed.
-        resolved_question = question
-        rewrite_note = ""
-        # Detection and rewriting are separate facts. A follow-up that the model leaves
-        # unchanged is still a follow-up - "What is my name?" is self-contained as a
-        # string, yet only answerable from the conversation. Recording only rewrites
-        # would hide the cases where history was used but the wording did not change.
-        followup_detected = bool(
-            history and needs_conversation_context(question, len(history))
+        prepared = await self._prepare(
+            db,
+            workspace_id=workspace_id,
+            question=question,
+            result=result,
+            mode=mode,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            document_ids=document_ids,
+            use_rerank=use_rerank,
+            trace=trace,
+            history=history,
+            page_number=page_number,
+            section=section,
         )
-        if followup_detected and mode == "online":
-            try:
-                rewrite_response = await self.adapter.generate(
-                    build_rewrite_messages(question, history),
-                    mode=mode,
-                    temperature=0.0,
-                    max_tokens=80,
-                )
-                candidate = clean_rewrite(rewrite_response.text, question)
-                if candidate and candidate.strip() != question.strip():
-                    resolved_question = candidate
-                    rewrite_note = "Question rewritten using the conversation."
-            except Exception as exc:  # noqa: BLE001 - a failed rewrite is not fatal
-                # Deliberately broad: ANY problem here must degrade to the original
-                # question rather than fail the request. The user asked a question;
-                # a helper step going wrong is not their problem.
-                logger.warning("Query rewrite skipped: %s", exc.__class__.__name__)
-
-        # A unit reference is expanded rather than filtered. Section metadata is only
-        # as complete as the document's headings - a document can have sections for
-        # UNIT I, IV and V and none for II or III - so searching the CONTENT for the
-        # canonical form works where a filter would find nothing.
-        unit_note = ""
-        if resolved_question:
-            expanded, unit_note = expand_unit_reference(resolved_question)
-            if unit_note:
-                resolved_question = expanded
-
-        if resolved_question != question:
-            result.question = resolved_question
-
-
-
-        # =================================================================
-        # RETRIEVAL  (blocking work, so it runs off the event loop)
-        # =================================================================
-        try:
-            retrieval: RetrievalOutcome = await asyncio.to_thread(
-                self.retriever.retrieve,
-                db,
-                workspace_id=workspace_id,
-                question=resolved_question,
-                top_k=top_k,
-                candidate_k=candidate_k,
-                page_number=page_number,
-                section=section,
-                document_ids=document_ids,
-                use_rerank=use_rerank,
-                trace=trace,
-            )
-        except CarinaaError as exc:
-            result.error = exc.message
-            result.error_code = exc.code
-            result.total_ms = int((time.perf_counter() - started) * 1000)
-            raise
-
-        result.retrieval = retrieval
-
-        # =================================================================
-        # CONTEXT BUILDING
-        # =================================================================
-        with trace.stage("context_building") as info:
-            bundle = build_context(retrieval.chunks)
-            stats = context_stats(bundle)
-            info.update(stats)
-        result.context = bundle
-
-        # Two views of the SAME evidence, and the difference matters:
-        #
-        #   prompt_excerpts   only what the model needs to read: number, label, text.
-        #                     Keeping the prompt minimal means we are never handing the
-        #                     model data it has no use for.
-        #
-        #   evidence_excerpts the full records - document_id, file name, provenance
-        #                     metadata and the real similarity score. Citation
-        #                     resolution and grounding NEED these, otherwise a citation
-        #                     can only render as "Document None" with a score of 0.0
-        #                     even though it resolved to a real chunk.
-        #
-        # Passing the prompt-shaped list to the citation resolver was a real bug: the
-        # `[1]` resolved to a genuine excerpt, but every piece of information that made
-        # it *clickable* had been thrown away one line earlier.
-        prompt_excerpts = bundle.as_prompt_list()
-        evidence_excerpts = bundle.as_dict()["excerpts"]
 
         # =================================================================
         # GENERATION
@@ -294,11 +415,10 @@ class RAGPipeline:
             llm_response: LLMResponse = await self.adapter.generate(
                 build_generation_messages(
                     question,
-                    prompt_excerpts,
+                    prepared.prompt_excerpts,
                     history=history,
                     language=language,
                     web_sources=web_sources,
-                    # Offline gets a shorter prompt written for the 3B local model.
                     mode=mode,
                 ),
                 mode=mode,
@@ -313,134 +433,186 @@ class RAGPipeline:
             result.token_usage = llm_response.token_usage
 
         except (LocalModelUnavailable, LLMError) as exc:
-            # -----------------------------------------------------------
-            # OFFLINE FAIL-SAFE
-            # -----------------------------------------------------------
-            # This is the ONLY place a degraded answer is produced, and it is
-            # produced locally from retrieved evidence. We do not fall back to an
-            # online provider, ever - see app/llm/adapter.py.
-            if mode == "offline" and settings.offline_extractive_failsafe:
-                logger.warning("Local model unavailable; using the extractive fail-safe.")
-                with trace.stage("failsafe") as info:
-                    text, meta = build_extractive_answer(question, evidence_excerpts)
-                    info.update(
-                        {
-                            "reason": str(exc),
-                            "sentences_quoted": meta.get("sentences", 0),
-                            "used_language_model": False,
-                            "contacted_online_service": False,
-                        }
-                    )
-                result.answer = text
-                result.provider = "local"
-                result.model = "extractive"
-                result.is_extractive_failsafe = True
-                result.fallback_reason = str(exc)
-            else:
-                result.error = str(exc)
-                result.error_code = getattr(exc, "code", "llm_error")
-                result.generation_ms = int(
-                    (time.perf_counter() - generation_started) * 1000
+            self._offline_failsafe(
+                result, exc, question=question, mode=mode, prepared=prepared,
+                started=started, generation_started=generation_started,
+            )
+
+        result.generation_ms = int((time.perf_counter() - generation_started) * 1000)
+        self._finalize(
+            result, prepared, question=question, web_sources=web_sources, started=started
+        )
+        return result
+
+    async def stream_answer(
+        self,
+        db: Session,
+        *,
+        workspace_id: int,
+        question: str,
+        mode: str = "online",
+        top_k: int | None = None,
+        candidate_k: int | None = None,
+        document_ids: Sequence[int] | None = None,
+        use_rerank: bool | None = None,
+        web_sources: list[dict[str, Any]] | None = None,
+        language: str = "en",
+        trace: TraceRecorder | None = None,
+        history: list[dict[str, str]] | None = None,
+        page_number: int | None = None,
+        section: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Answer a question, yielding REAL text deltas as the provider produces them.
+
+        Yields dicts:
+            {"type": "delta", "text": "..."}     a real provider fragment
+            {"type": "done", "result": RAGAnswer} the finished, cited, grounded answer
+
+        Errors propagate as exceptions, exactly as `answer` does. The caller (the
+        SSE route) catches them and reports the failure, including the trace that
+        was recorded up to that point - never a completed pipeline for a run that
+        produced no answer.
+
+        The deltas are NOT a chopped-up finished answer: each one is emitted the
+        moment the provider sends it, and the stages recorded during retrieval are
+        already in the trace when the first delta is yielded.
+        """
+        started = time.perf_counter()
+        trace = trace or TraceRecorder()
+        result = RAGAnswer(question=question, answer="", mode=mode, trace=trace)
+
+        prepared = await self._prepare(
+            db,
+            workspace_id=workspace_id,
+            question=question,
+            result=result,
+            mode=mode,
+            top_k=top_k,
+            candidate_k=candidate_k,
+            document_ids=document_ids,
+            use_rerank=use_rerank,
+            trace=trace,
+            history=history,
+            page_number=page_number,
+            section=section,
+        )
+
+        messages = build_generation_messages(
+            question,
+            prepared.prompt_excerpts,
+            history=history,
+            language=language,
+            web_sources=web_sources,
+            mode=mode,
+        )
+
+        generation_started = time.perf_counter()
+        meta: dict[str, Any] = {}
+        parts: list[str] = []
+
+        try:
+            async for fragment in self.adapter.stream(messages, mode=mode, meta=meta):
+                parts.append(fragment)
+                yield {"type": "delta", "text": fragment}
+
+            result.answer = "".join(parts)
+            result.provider = str(meta.get("provider", ""))
+            result.model = str(meta.get("model", ""))
+            result.used_fallback = bool(meta.get("used_fallback"))
+            result.fallback_reason = str(meta.get("fallback_reason", ""))
+            result.primary_attempted = str(meta.get("primary_attempted", ""))
+            # Usage is not reported by a streaming provider, so nothing is invented:
+            # the trace records that the run was streamed instead of a token count.
+            result.token_usage = {"streamed": True}
+
+            if trace:
+                trace.add(
+                    "llm_generation",
+                    duration_ms=int((time.perf_counter() - generation_started) * 1000),
+                    data={
+                        "mode": mode,
+                        "provider": result.provider,
+                        "model": result.model,
+                        "role": meta.get("role", "primary"),
+                        "used_fallback": result.used_fallback,
+                        "streamed": True,
+                        "note": (
+                            "The answer was streamed token by token as the model "
+                            "produced it. Token counts are not reported by a "
+                            "streaming provider, so none are shown."
+                        ),
+                        **(
+                            {"fallback_reason": result.fallback_reason}
+                            if result.fallback_reason
+                            else {}
+                        ),
+                    },
                 )
-                result.total_ms = int((time.perf_counter() - started) * 1000)
+        except (LocalModelUnavailable, LLMError) as exc:
+            # Only recoverable if NOTHING has been streamed yet. If text already
+            # reached the client, the caller reports the failure and the partial
+            # text is discarded rather than presented as a complete answer.
+            if parts:
                 raise
+            self._offline_failsafe(
+                result, exc, question=question, mode=mode, prepared=prepared,
+                started=started, generation_started=generation_started,
+            )
+            yield {"type": "delta", "text": result.answer}
 
         result.generation_ms = int((time.perf_counter() - generation_started) * 1000)
 
-        # =================================================================
-        # MARKER NORMALISATION
-        # =================================================================
-        # Providers disagree about what a citation bracket looks like. Gemini emits
-        # ASCII "[1]"; the Groq fallback has been observed emitting the full-width
-        # CJK form "【1】". Left alone, that difference silently disabled citation
-        # resolution AND grounding: a properly cited answer was reported as citing
-        # nothing, and grounding was downgraded to PARTIALLY_SUPPORTED.
-        #
-        # We canonicalise once, here, so the stored answer, its citation rows, the
-        # RAG Trace, Read Aloud and the transform validators all read one form.
-        normalized_answer = normalize_citation_markers(result.answer)
-        if normalized_answer != result.answer:
-            logger.info(
-                "Normalised non-ASCII citation brackets in the generated answer."
-            )
-            result.answer = normalized_answer
+        self._finalize(
+            result, prepared, question=question, web_sources=web_sources, started=started
+        )
+        yield {"type": "done", "result": result}
 
-        # =================================================================
-        # CITATION RESOLUTION
-        # =================================================================
-        with trace.stage("citation_resolution") as info:
-            citation_report = resolve_citations(
-                result.answer, evidence_excerpts, web_sources=web_sources
-            )
-            info.update(
-                {
-                    "citations_found": len(citation_report.citations),
-                    "cited_numbers": citation_report.cited_numbers,
-                    "invalid_numbers": citation_report.invalid_numbers,
-                    "unused_excerpts": citation_report.unused_numbers,
-                    "valid": citation_report.valid,
-                }
-            )
-        result.citations = citation_report
+    def _offline_failsafe(
+        self,
+        result: RAGAnswer,
+        exc: Exception,
+        *,
+        question: str,
+        mode: str,
+        prepared: _Prepared,
+        started: float,
+        generation_started: float,
+    ) -> None:
+        """The ONLY place a degraded answer is produced, and it is local.
 
-        # =================================================================
-        # GROUNDING
-        # =================================================================
-        with trace.stage("grounding") as info:
-            grounding = check_grounding(
-                result.answer,
-                evidence_excerpts,
-                citation_report,
-                top_score=retrieval.top_score,
-            )
-            info.update(
-                {
-                    "status": grounding.status,
-                    "refused": grounding.refused,
-                    "supported_sentences": grounding.supported_count,
-                    "weak_sentences": grounding.weak_count,
-                    "uncited_sentences": grounding.uncited_count,
-                    "checks": {
-                        name: check.get("passed")
-                        for name, check in grounding.checks.items()
-                    },
-                }
-            )
-        result.grounding = grounding
+        We never fall back to an online provider, ever - see app/llm/adapter.py.
+        """
+        if mode == "offline" and settings.offline_extractive_failsafe:
+            logger.warning("Local model unavailable; using the extractive fail-safe.")
+            trace = result.trace
+            with trace.stage("failsafe") as info:  # type: ignore[union-attr]
+                text, meta = build_extractive_answer(question, prepared.evidence_excerpts)
+                info.update(
+                    {
+                        "reason": str(exc),
+                        "sentences_quoted": meta.get("sentences", 0),
+                        "used_language_model": False,
+                        "contacted_online_service": False,
+                    }
+                )
+            result.answer = text
+            result.provider = "local"
+            result.model = "extractive"
+            result.is_extractive_failsafe = True
+            result.fallback_reason = str(exc)
+            return
 
-        # Annotate the trace once the run is complete. This has to happen HERE, not
-        # earlier: `query_analysis` is recorded during retrieval, so writing to it
-        # before the pipeline ran silently did nothing - the event did not exist yet
-        # and the note was lost without any error.
-        # Every query-understanding annotation is applied HERE, together.
-        #
-        # Writing them earlier silently did nothing: `query_analysis` is recorded during
-        # retrieval, so before the pipeline runs there is no event to annotate. The
-        # notes were computed correctly and then dropped without any error - which is
-        # why the trace showed a resolved question as None while the answer was right.
-        understanding_notes: dict[str, Any] = {}
-        if followup_detected:
-            understanding_notes.update(
-                {
-                    "original_question": question,
-                    "resolved_question": resolved_question,
-                    "is_followup": True,
-                    "rewrite_reason": rewrite_note
-                    or "The question needed the conversation; it was already "
-                    "self-contained so the wording was left unchanged.",
-                }
-            )
-        if unit_note:
-            understanding_notes["unit_reference"] = unit_note
-
-        if understanding_notes:
-            for event in trace.events:
-                if event.stage == "query_analysis":
-                    event.data.update(understanding_notes)
-                    break
-
+        result.error = str(exc)
+        result.error_code = getattr(exc, "code", "llm_error")
+        result.generation_ms = int((time.perf_counter() - generation_started) * 1000)
         result.total_ms = int((time.perf_counter() - started) * 1000)
-        return result
+        raise exc
+
+    # =====================================================================
+    # Introspection
+    # =====================================================================
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<RAGPipeline>"
 
 
 _pipeline: RAGPipeline | None = None
