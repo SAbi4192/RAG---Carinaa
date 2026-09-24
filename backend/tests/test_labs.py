@@ -267,7 +267,8 @@ def test_frontend_explains_every_stage(client, make_user) -> None:
         pytest.skip("frontend sources are not present in this checkout")
 
     source = explanations.read_text(encoding="utf-8")
-    frontend_stages = re.findall(r'^\s*stage:\s*"([a-z_]+)"', source, re.MULTILINE)
+    # Stage ids can contain digits ("bm25_search"), so the pattern must too.
+    frontend_stages = re.findall(r'^\s*stage:\s*"([a-z0-9_]+)"', source, re.MULTILINE)
 
     backend_all = [item["stage"] for item in stage_definitions()] + [
         item["stage"] for item in conditional_stage_definitions()

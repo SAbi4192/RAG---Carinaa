@@ -5,12 +5,14 @@ import {
   Database,
   FileSearch,
   Globe,
+  KeyRound,
   Layers,
   ListChecks,
   MessageSquareText,
   ScanSearch,
   ShieldCheck,
   Sparkles,
+  Waypoints,
 } from "lucide-react";
 
 /**
@@ -192,6 +194,30 @@ export const STAGE_EXPLANATIONS: StageExplanation[] = [
     without: "Offline mode would fail with an error even though the evidence needed to answer was already in hand.",
     where: "app/rag/failsafe.py",
     lookFor: "the answer is labelled as extractive in the UI, and the provider reads \"Extractive (no model)\". It is never presented as generated prose, and no online provider is contacted to produce it.",
+  },
+  {
+    stage: "bm25_search",
+    label: "Keyword search (BM25)",
+    icon: KeyRound,
+    conditional: true,
+    simple: "Alongside searching by meaning, Carinaa also searched for the exact words you used — useful when the answer contains a name, a number or a code.",
+    what: "Okapi BM25 scores each chunk by how many of the question's words it contains, weighting rare words higher than common ones.",
+    why: "Embeddings are excellent at meaning and weaker at exact references. 'RFC 1918', an error code, or 'UNIT III' is a string problem, and BM25 is the classical answer to it. It complements the vector search rather than replacing it.",
+    without: "In hybrid mode the fusion loses its lexical half and falls back to meaning-only ranking, which is exactly the mode that can miss a literal reference. In keyword-only mode, questions phrased differently from the document stop matching at all.",
+    where: "app/rag/hybrid.py",
+    lookFor: "it appears only when retrieval mode is bm25 or hybrid. Its scores are unbounded and comparable only to other BM25 scores — the trace never puts them on the same scale as a cosine similarity.",
+  },
+  {
+    stage: "rrf_fusion",
+    label: "Rank fusion (RRF)",
+    icon: Waypoints,
+    conditional: true,
+    simple: "Carinaa merges the two rankings — one by meaning, one by exact words — into a single order so the AI gets the best of both.",
+    what: "Reciprocal Rank Fusion adds each chunk's reciprocal position in each list, weighted, and sorts by the total.",
+    why: "Cosine similarity and BM25 score on unrelated scales, so adding them would let whichever has bigger numbers silently win. RRF uses only the ORDER of each list, which is scale-free: being high in either list is good, and high in both is best.",
+    without: "You would need a single retriever again, giving up either meaning search or exact-word search. Alternatively you would 'combine' two incomparable scores, which produces a confident-looking ranking that is statistically meaningless.",
+    where: "app/rag/hybrid.py",
+    lookFor: "it appears only in hybrid mode. Compare the fused order against the two source lists in the Retrieval Lab — a chunk that was 12th in both lists and first in the fusion is what RRF is for.",
   },
 ];
 

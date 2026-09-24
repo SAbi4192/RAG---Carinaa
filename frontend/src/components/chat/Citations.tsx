@@ -256,11 +256,18 @@ export function CitationCard({
 
         <div className="flex shrink-0 items-center gap-1">
           {citation.document_id ? (
+            /* Opens the document ON this exact chunk: the viewer jumps to the
+               right page and pulses the passage, so the reader never has to hunt
+               for the evidence the citation is pointing at. Without the chunk id
+               it degrades to opening the document itself, which is still honest -
+               the link never claims to show a passage it cannot locate. */
             <Link
-              to={`/app/knowledge/${citation.document_id}`}
+              to={`/app/knowledge/${citation.document_id}${
+                citation.chunk_id ? `?chunk=${citation.chunk_id}` : ""
+              }`}
               className="rounded p-1 text-faint transition-colors hover:text-brand"
-              title="Open in the document viewer"
-              aria-label="Open source document"
+              title="Open the exact passage this citation came from"
+              aria-label="Open source passage in the document viewer"
             >
               <ExternalLink className="h-3 w-3" />
             </Link>

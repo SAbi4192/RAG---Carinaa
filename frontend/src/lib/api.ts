@@ -44,6 +44,7 @@ import type {
   PreviewChunksResponse,
   ProviderReport,
   RagSettings,
+  RetrieveCompareResponse,
   RetrieveResponse,
   RetrievalAnalytics,
   SecurityReport,
@@ -344,6 +345,13 @@ export const api = {
         `/documents/${documentId}/chunks?limit=${limit}&offset=${offset}`,
       ),
 
+    /** Where a chunk sits in the document's ordered list (for deep-linking a
+     *  citation to its exact position, across pagination). */
+    chunkPosition: (documentId: number, chunkId: number) =>
+      request<{ chunk_id: number; chunk_index: number; ordinal: number }>(
+        `/documents/${documentId}/chunks/${chunkId}/position`,
+      ),
+
     chunkStats: (documentId: number) =>
       request<Record<string, unknown>>(`/documents/${documentId}/chunk-stats`),
 
@@ -515,9 +523,78 @@ export const api = {
       page_number?: number;
       section?: string;
       conversation_id?: number;
+      /** Retriever mode for the lab: dense / bm25 / hybrid. */
+      mode?: "dense" | "bm25" | "hybrid";
     }) => request<RetrieveResponse>("/chat/retrieve", { method: "POST", body: payload }),
 
+    /** Compare the three retrievers over ONE question and scope (Retrieval Lab).
+     *
+     * The comparison runs server-side so all three modes see the identical
+     * population and the three columns are genuinely comparable. See the backend
+     * docstring: it deliberately runs them sequentially because they share a
+     * request-scoped database session, which is not thread-safe.
+     */
+    retrieveCompare: (payload: {
+      workspace_id: number;
+      question: string;
+      top_k?: number;
+      candidate_k?: number;
+      document_ids?: number[];
+      conversation_id?: number;
+    }) => request<RetrieveCompareResponse>("/chat/retrieve/compare", { method: "POST", body: payload }),
+
     trace: (messageId: number) => request<Trace>(`/messages/${messageId}/trace`),
+
+    /** Download an answer's Evidence Pack (Markdown or print-ready HTML).
+     *
+     * The server returns the file as an attachment, but the request needs the
+     * Authorization header, so a plain <a href> download cannot be used here.
+     * We fetch the bytes, hand them to the browser as a Blob, and let the
+     * Content-Disposition filename drive the save. A failure throws ApiError so
+     * the caller can surface it rather than starting a download that yields an
+     * empty file.
+     */
+    async downloadEvidencePack(
+      messageId: number,
+      format: "md" | "html",
+    ): Promise<void> {
+      const headers: Record<string, string> = {};
+      const token = getToken();
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      const response = await fetch(
+        `/api/messages/${messageId}/export?format=${format}`,
+        { headers },
+      );
+      if (!response.ok) {
+        let detail = "";
+        try {
+          detail = (await response.json())?.error?.message ?? "";
+        } catch {
+          /* an error body that is not JSON is still an error */
+        }
+        throw new ApiError(
+          detail || `The export failed (${response.status}).`,
+          response.status,
+          "export_failed",
+        );
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = /filename="?([^";]+)"?/i.exec(disposition);
+      const filename = match?.[1] || `carinaa-evidence-${messageId}.${format}`;
+
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      // Revoke on the next tick so the download has begun before the object URL
+      // disappears; revoking synchronously can abort the save in some browsers.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
 
     deleteMessage: (messageId: number) =>
       request<void>(`/messages/${messageId}`, { method: "DELETE" }),
@@ -730,19 +807,22 @@ async function consumeSse(
       case "error": {
         terminal = true;
         const info = payload?.error ?? payload ?? {};
-        try {
-          handlers.onError?.(
-            new ApiError(
-              info.message || "The answer could not be completed.",
-              Number(info.status ?? 500),
-              info.code || "stream_error",
-              info.detail || {},
-            ),
-          );
-        } catch {
-          /* handler error - the stream is over */
-        }
-        break;
+        const err = new ApiError(
+          info.message || "The answer could not be completed.",
+          Number(info.status ?? 500),
+          info.code || "stream_error",
+          info.detail || {},
+        );
+        // Do NOT swallow the handler here. The caller's `onError` re-throws (see
+        // Chat.tsx) so that its `catch` can roll back the optimistic turn, restore
+        // the question text and show the error card. Wrapping it in try/catch
+        // previously turned every streamed failure into a silent no-op: the
+        // promise resolved, the catch block never ran, and the user was left with
+        // a dangling message and no indication anything went wrong.
+        handlers.onError?.(err);
+        // If the handler decided not to throw (it is optional), the failed stream
+        // must still reject so the caller's promise semantics are consistent.
+        throw err;
       }
     }
   };

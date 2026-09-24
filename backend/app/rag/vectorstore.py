@@ -97,6 +97,23 @@ class RetrievedChunk:
     # adjustment - the blend is an amendment, never a replacement.
     original_score: float | None = None
 
+    # Declared explicitly because the dataclass uses slots=True, so an attribute
+    # that is not a field cannot be set at runtime. These are populated only by
+    # the stages that use them:
+    #   original_rank / rerank_score  by the cross-encoder re-ranker, so the UI
+    #       can show a chunk's movement WITHOUT overwriting its cosine score -
+    #       the two are different scales and must never be mixed.
+    #   bm25_score / bm25_rank        by the lexical half of hybrid retrieval.
+    #   rrf_score / rrf_rank          the fused ranking's reciprocal-rank score
+    #       and position, recorded so a hybrid run can show how fusion re-ordered
+    #       the candidates instead of merely showing the result.
+    original_rank: int | None = None
+    rerank_score: float | None = None
+    bm25_score: float | None = None
+    bm25_rank: int | None = None
+    rrf_score: float | None = None
+    rrf_rank: int | None = None
+
     def citation_label(self) -> str:
         """Short human label, e.g. 'Cloud_Computing.pdf p.32'."""
         parts = [self.document_name or f"Document {self.document_id}"]

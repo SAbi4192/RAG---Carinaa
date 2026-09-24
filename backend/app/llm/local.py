@@ -320,6 +320,7 @@ class LocalProvider:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Yield real token deltas from llama.cpp, order-preserving.
 
@@ -328,6 +329,10 @@ class LocalProvider:
         hold: the lock is held for the whole generation (a llama.cpp context is
         single-state, so two concurrent streams would corrupt the KV cache), and no
         network call is made - the offline guarantee applies to streaming too.
+
+        A stream that yields nothing raises the same "empty response" error the
+        buffered path raises, so an empty local generation can never be committed
+        as a complete answer. The finish reason is reported through `meta`.
         """
         if not self.load():
             raise LLMError(
@@ -351,6 +356,7 @@ class LocalProvider:
 
         fragments: queue.Queue[Any] = queue.Queue()
         sentinel = object()
+        shared: dict[str, Any] = {"fragments": 0, "finish_reason": ""}
 
         def produce() -> None:
             try:
@@ -368,7 +374,11 @@ class LocalProvider:
                             continue
                         delta = (choices[0].get("delta") or {}).get("content")
                         if delta:
+                            shared["fragments"] += 1
                             fragments.put(str(delta))
+                        reason = (choices[0] or {}).get("finish_reason")
+                        if reason:
+                            shared["finish_reason"] = str(reason)
                 fragments.put(sentinel)
             except Exception as exc:  # noqa: BLE001 - re-raised in the consumer
                 fragments.put(exc)
@@ -387,6 +397,11 @@ class LocalProvider:
                     retryable=False,
                 ) from item
             yield item
+
+        if meta is not None and shared.get("finish_reason"):
+            meta["finish_reason"] = shared["finish_reason"]
+        if shared["fragments"] == 0:
+            raise LLMError("The local model returned an empty response.")
 
     # ------------------------------------------------------------------- info
     def info(self) -> dict[str, Any]:

@@ -39,6 +39,7 @@ from app.core.errors import (
     ProviderNotConfigured,
     ProviderRateLimited,
 )
+from app.core.errors import LLMError as CoreLLMError
 from app.core.logging import get_logger
 from app.llm.base import (
     LLMError,
@@ -539,7 +540,12 @@ class LLMAdapter:
                         # Text already reached the client. Committing here is the only
                         # honest option: re-streaming from another model would deliver an
                         # answer that is part Groq, part Gemini, under one provider label.
-                        raise
+                        # The provider error is translated from app.llm.base.LLMError
+                        # (a plain Exception) into the core error the pipeline and the
+                        # SSE route actually handle, so the committed failure is reported
+                        # honestly and its trace is persisted - not surfaced as an
+                        # unexpected internal error with the trace dropped.
+                        raise CoreLLMError(str(exc)) from exc
                     if not exc.retryable:
                         break
             if yielded:
@@ -575,7 +581,7 @@ class LLMAdapter:
                 except LLMError as exc:
                     primary_error = exc
                     if yielded:
-                        raise
+                        raise CoreLLMError(str(exc)) from exc
                     if not exc.retryable:
                         break
 
@@ -619,10 +625,21 @@ class LLMAdapter:
                     "used_fallback": False,
                 }
             )
-        async for fragment in self.local.stream(
-            messages, temperature=temperature, max_tokens=max_tokens
-        ):
-            yield fragment
+        try:
+            async for fragment in self.local.stream(
+                messages, temperature=temperature, max_tokens=max_tokens
+            ):
+                yield fragment
+        except LLMError as exc:
+            # Same translation as the online path: the pipeline and the SSE route
+            # only understand core.errors.LLMError (a CarinaaError), while the
+            # provider raises app.llm.base.LLMError (a plain Exception). Without
+            # this an offline mid-generation failure would escape both handlers
+            # and surface as an unexpected internal_error while its trace is
+            # dropped - the exact failure the failure-trace persistence exists to
+            # prevent. A not-yet-started failure (no fragments) still reaches the
+            # pipeline's offline fail-safe because this happens before any yield.
+            raise CoreLLMError(str(exc)) from exc
 
     # =====================================================================
     # Introspection for the Settings page

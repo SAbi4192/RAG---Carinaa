@@ -11,6 +11,25 @@
     <title>Carinaa — Every Answer, Traceable</title>
 
     <!--
+      PWA identity. These lines plus /public/manifest.webmanifest, the icon
+      files and /public/sw.js make Carinaa installable: a browser will offer
+      "Install Carinaa", launch it standalone (no address bar), and keep the
+      app shell available offline. The manifest and worker are plain files
+      copied verbatim into the build, so this works without any PWA plugin -
+      keeping the build free of a tool that would otherwise have to be trusted
+      about caching. The service worker never caches /api (see public/sw.js).
+    -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="application-name" content="Carinaa" />
+    <meta name="theme-color" content="#7c3aed" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Carinaa" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <!--
       Theme bootstrap.
 
       This runs before React mounts so the correct theme is applied on the very

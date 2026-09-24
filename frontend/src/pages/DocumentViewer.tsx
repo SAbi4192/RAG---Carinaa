@@ -1,5 +1,5 @@
-import { useCallback, useMemo, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -56,7 +56,30 @@ export default function DocumentViewer() {
   const navigate = useNavigate();
   const toast = useToast();
 
+  /**
+   * Citation deep-linking.
+   *
+   * `?chunk=<id>` asks the viewer to open ON the exact chunk a citation pointed
+   * at, not merely at the top of the document. The chunk id is the primary key,
+   * not the index, so the page number is computed by the backend
+   * (`/chunks/<id>/position`) and we jump to that page, then highlight and scroll
+   * to the entry once it renders.
+   *
+   * The "why this exists" matters more than the mechanics. A `[1]` that opens a
+   * wall of 300 chunks does not prove the evidence - the reader has to hunt for
+   * it, which is exactly what the citation was supposed to remove. Jumping to the
+   * one passage and pulsing it is the difference between *claiming* traceability
+   * and *demonstrating* it.
+   */
+  const [searchParams] = useSearchParams();
+  const focusChunkId = (() => {
+    const value = searchParams.get("chunk");
+    const parsed = value ? Number.parseInt(value, 10) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  })();
+
   const [page, setPage] = useState(0);
+  const [highlightedChunkId, setHighlightedChunkId] = useState<number | null>(null);
   const [reindexing, setReindexing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -80,6 +103,45 @@ export default function DocumentViewer() {
 
   const isProcessing = doc?.status === "processing" || doc?.status === "pending";
   const totalPages = doc ? Math.max(1, Math.ceil(doc.chunk_count / PAGE_SIZE)) : 1;
+
+  // Resolve the deep-linked chunk to its page (its id is a primary key, not an
+  // index, so the backend answers the ordering question). Runs once per target.
+  const positionResolvedFor = useRef<number | null>(null);
+  useEffect(() => {
+    if (!documentId || !focusChunkId) return;
+    if (positionResolvedFor.current === focusChunkId) return;
+    positionResolvedFor.current = focusChunkId;
+    let cancelled = false;
+    api.documents
+      .chunkPosition(documentId, focusChunkId)
+      .then((position) => {
+        if (cancelled) return;
+        setHighlightedChunkId(focusChunkId);
+        setPage(Math.floor(position.ordinal / PAGE_SIZE));
+      })
+      .catch(() => {
+        /* A missing/foreign chunk is simply not highlighted - the viewer still
+           opens on the document, which is the pre-existing behaviour. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [documentId, focusChunkId]);
+
+  // Once the target chunk is on screen (its page loaded), bring it into view
+  // once. The user keeps the scroll wheel immediately after - this is a
+  // one-shot reposition, not a hijack.
+  useEffect(() => {
+    if (highlightedChunkId == null) return;
+    if (!chunks.data?.some((chunk) => chunk.id === highlightedChunkId)) return;
+    const node = window.document.getElementById(`chunk-${highlightedChunkId}`);
+    if (!node) return;
+    const reduced =
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    node.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "center" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot per highlighted chunk, after its page renders
+  }, [highlightedChunkId, chunks.data]);
 
   const handleReindex = useCallback(async () => {
     if (!documentId) return;
@@ -411,8 +473,18 @@ export default function DocumentViewer() {
                     const location = buildLocation(chunkMeta);
 
                     return (
-                      <li key={chunk.id} className="px-5 py-4">
+                      <li
+                        key={chunk.id}
+                        id={`chunk-${chunk.id}`}
+                        className={cn(
+                          "px-5 py-4 transition-colors",
+                          chunk.id === highlightedChunkId && "chunk-focus",
+                        )}
+                      >
                         <div className="flex flex-wrap items-center gap-2">
+                          {chunk.id === highlightedChunkId ? (
+                            <Badge tone="positive">this passage</Badge>
+                          ) : null}
                           <Badge tone="brand" mono>
                             #{chunk.chunk_index}
                           </Badge>

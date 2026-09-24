@@ -22,6 +22,7 @@ import {
 
 import { cn } from "@/lib/cn";
 import { useIsCompact } from "@/hooks/useMediaQuery";
+import { appSection } from "@/motion";
 import { useAuth } from "@/state/auth";
 import { useTheme } from "@/state/theme";
 import { useWorkspaces } from "@/state/workspace";
@@ -405,6 +406,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const isCompact = useIsCompact();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const location = useLocation();
+  // Drives the page transition below; see the comment on the <main> element.
+  const section = appSection(location.pathname);
 
   /**
    * Collapsed navigation.
@@ -497,7 +500,23 @@ export function AppShell({ children }: { children: ReactNode }) {
           </header>
         ) : null}
 
-        <main className="min-w-0 flex-1">{children}</main>
+        {/*
+          Page transition (section 57). The content is keyed on the *section*
+          (the first path segment under /app), not the full path, so a real
+          change of screen - Chat, Learning, Playground, Analytics - replays one
+          quick, shared entrance animation, while moving between two
+          conversations of the same screen (…/chat/5 → …/chat/6) does NOT
+          remount. That is deliberate: keying on the whole path would tear down
+          Chat mid-answer and drop the live stream every time the conversation id
+          updated. `animate-fade-in` is a global utility and is disabled under
+          prefers-reduced-motion like every other animation here, so the
+          transition can never hide content from a user who asked for no motion.
+        */}
+        <main className="min-w-0 flex-1">
+          <div key={section || "app"} className="animate-fade-in">
+            {children}
+          </div>
+        </main>
       </div>
     </div>
   );

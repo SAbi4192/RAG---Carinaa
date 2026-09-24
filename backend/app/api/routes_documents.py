@@ -399,6 +399,48 @@ def list_chunks(
     ]
 
 
+@router.get("/documents/{document_id}/chunks/{chunk_id}/position")
+def chunk_position(
+    document_id: int,
+    chunk_id: int,
+    user: CurrentUser,
+    db: DbSession,
+) -> dict:
+    """Where one chunk sits in this document's ordered chunk list.
+
+    WHY THIS EXISTS. The viewer paginates chunks in `chunk_index` order, but a
+    citation only carries a chunk's primary-key id. To open ON the exact chunk a
+    citation points at (not merely its document), the viewer needs to know which
+    page that chunk falls on. Counting the chunks that sort before it answers
+    that in one query, and works whether or not the indices are contiguous.
+
+    The chunk is also verified to belong to the document here, so a caller cannot
+    learn the position of a chunk from another document (or another workspace):
+    the same `_load_document` workspace check guards both ends.
+    """
+    _load_document(db, user, document_id)
+
+    chunk = db.scalar(
+        select(Chunk).where(Chunk.id == chunk_id, Chunk.document_id == document_id)
+    )
+    if chunk is None:
+        raise NotFound(
+            "That chunk does not belong to this document.",
+            code="chunk_not_found",
+        )
+
+    ordinal = (
+        db.scalar(
+            select(func.count(Chunk.id)).where(
+                Chunk.document_id == document_id,
+                Chunk.chunk_index < chunk.chunk_index,
+            )
+        )
+        or 0
+    )
+    return {"chunk_id": chunk.id, "chunk_index": chunk.chunk_index, "ordinal": int(ordinal)}
+
+
 @router.get("/documents/{document_id}/chunk-stats")
 def chunk_stats(document_id: int, user: CurrentUser, db: DbSession) -> dict:
     """Chunking statistics for the Document Viewer page."""

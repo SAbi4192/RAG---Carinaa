@@ -117,6 +117,14 @@ class RetrievalOutcome:
     reranked: bool = False
     rerank_info: dict[str, Any] = field(default_factory=dict)
 
+    # Which retriever actually produced this ranking, and the score scale the
+    # `score` fields are on. Reported alongside the numbers so a UI can never
+    # label a reciprocal-rank score as a cosine similarity.
+    mode: str = "dense"
+    score_scale: str = "cosine"
+    # Full three-list comparison (dense, bm25, fused) when hybrid ran.
+    hybrid: dict[str, Any] = field(default_factory=dict)
+
     @property
     def top_score(self) -> float:
         return max((c.score for c in self.chunks), default=0.0)
@@ -129,6 +137,10 @@ class RetrievalOutcome:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            # Which retriever produced this ranking and on what scale, so no UI
+            # can mislabel an RRF or BM25 number as a cosine similarity.
+            "mode": self.mode,
+            "score_scale": self.score_scale,
             "candidates_retrieved": self.candidates_retrieved,
             "returned": len(self.chunks),
             "duplicates_removed": self.duplicates_removed,
@@ -141,6 +153,10 @@ class RetrievalOutcome:
             "total_ms": self.total_ms,
             "reranked": self.reranked,
             "rerank": self.rerank_info,
+            # The three rankings (dense / bm25 / fused) when hybrid ran, so the
+            # Retrieval Lab and Learning Mode can show what fusion actually did
+            # instead of only its result. Empty otherwise.
+            "hybrid": self.hybrid,
             "analysis": self.analysis.as_dict() if self.analysis else None,
             "chunks": [
                 {
@@ -149,13 +165,23 @@ class RetrievalOutcome:
                     "document_name": c.document_name,
                     "file_type": c.file_type,
                     "chunk_index": c.chunk_index,
+                    "vector_id": c.vector_id,
                     "score": round(c.score, 4),
                     "rank": c.rank,
                     "original_rank": getattr(c, "original_rank", None),
                     "rerank_score": getattr(c, "rerank_score", None),
+                    # Hybrid provenance: where each method ranked this chunk, so a
+                    # fused answer can show it moved (or did not) without hiding the
+                    # source. None when the mode did not compute it.
+                    "original_score": c.original_score,
+                    "bm25_score": getattr(c, "bm25_score", None),
+                    "bm25_rank": getattr(c, "bm25_rank", None),
+                    "rrf_score": getattr(c, "rrf_score", None),
+                    "rrf_rank": getattr(c, "rrf_rank", None),
                     "label": c.citation_label(),
                     "metadata": c.metadata,
                     "content": c.content,
+                    "char_start": getattr(c, "char_start", None),
                     "preview": c.content[:280] + ("..." if len(c.content) > 280 else ""),
                 }
                 for c in self.chunks
@@ -234,14 +260,25 @@ class Retriever:
         section: str | None = None,
         use_rerank: bool | None = None,
         trace: TraceRecorder | None = None,
+        mode: str | None = None,
     ) -> RetrievalOutcome:
-        """Full retrieval: analyse, embed, search, optionally re-rank, join."""
+        """Full retrieval: analyse, search (dense/bm25/hybrid), join, optionally re-rank."""
         started = time.perf_counter()
         outcome = RetrievalOutcome()
 
         top_k = top_k or settings.top_k
         candidate_k = max(candidate_k or settings.candidate_k, top_k)
         rerank_enabled = settings.rerank_enabled if use_rerank is None else use_rerank
+
+        # One retriever mode for the run, resolved once. `dense` is the default
+        # and the ONLY mode this codebase had before hybrid retrieval existed, so
+        # a run that does not ask for a mode behaves exactly as it did then -
+        # the same vectors, the same blend, the same ranking.
+        mode = (mode or settings.retrieval_mode or "dense").strip().lower()
+        if mode not in ("dense", "bm25", "hybrid"):
+            mode = "dense"
+        outcome.mode = mode
+        outcome.score_scale = {"dense": "cosine", "bm25": "bm25", "hybrid": "rrf"}[mode]
 
         # ---------------------------------------------------------------
         # Stage 1 - query analysis
@@ -255,68 +292,115 @@ class Retriever:
                         "word_count": outcome.analysis.word_count,
                         "is_question": outcome.analysis.is_question,
                         "keywords": outcome.analysis.keywords[:8],
+                        "retrieval_mode": mode,
                     }
                 )
         else:
             outcome.analysis = analyze_query(question)
 
         # ---------------------------------------------------------------
-        # Stage 2 - query embedding (same model as the chunks)
+        # Stage 2 - query embedding. Needed by the vector search, so dense
+        # and hybrid do it; BM25-only does not, and an embedding that is
+        # never used should not be billed to the user as if it were.
         # ---------------------------------------------------------------
-        embed_start = time.perf_counter()
-        if trace:
-            with trace.stage("query_embedding") as info:
+        query_vector = None
+        if mode in ("dense", "hybrid"):
+            embed_start = time.perf_counter()
+            if trace:
+                with trace.stage("query_embedding") as info:
+                    query_vector = self.embeddings.embed_query(outcome.analysis.normalized)
+                    info["model"] = self.embeddings.model_name
+                    info["dimension"] = int(query_vector.shape[-1])
+            else:
                 query_vector = self.embeddings.embed_query(outcome.analysis.normalized)
-                info["model"] = self.embeddings.model_name
-                info["dimension"] = int(query_vector.shape[-1])
-        else:
-            query_vector = self.embeddings.embed_query(outcome.analysis.normalized)
-        outcome.embedding_ms = int((time.perf_counter() - embed_start) * 1000)
+            outcome.embedding_ms = int((time.perf_counter() - embed_start) * 1000)
+        elif trace:
+            trace.skip(
+                "query_embedding",
+                "keyword-only (BM25) retrieval compares words, not vectors, "
+                "so no embedding is computed",
+            )
 
         # ---------------------------------------------------------------
-        # Stage 3 - vector search (workspace-scoped, always)
+        # Stage 3 - search. Which search depends on the mode:
+        #   dense   the vector index only
+        #   bm25    the lexical index only
+        #   hybrid  both, fused by reciprocal rank
+        # All three see the SAME population: the same workspace, the same
+        # document/page/section scope. Otherwise the Retrieval Lab would be
+        # comparing methods over different corpora, which is not a comparison.
         # ---------------------------------------------------------------
         search_start = time.perf_counter()
-        try:
-            candidates = self.store.query(
+        fused_hybrid: dict[str, Any] = {}
+        candidates: list[RetrievedChunk] = []
+
+        if mode in ("dense", "hybrid"):
+            try:
+                candidates = self.store.query(
+                    workspace_id=workspace_id,
+                    query_embedding=query_vector,
+                    top_k=candidate_k,
+                    document_ids=document_ids,
+                    page_number=page_number,
+                    section=section,
+                )
+            except RetrievalError:
+                raise
+            except Exception as exc:
+                logger.exception("Retrieval failed for workspace %s", workspace_id)
+                raise RetrievalError(
+                    "The vector search could not be completed.",
+                    detail={"reason": exc.__class__.__name__},
+                ) from exc
+            outcome.search_ms = int((time.perf_counter() - search_start) * 1000)
+
+            if trace:
+                trace.add(
+                    "vector_search",
+                    status="ok",
+                    duration_ms=outcome.search_ms,
+                    data={
+                        "workspace_id": workspace_id,
+                        "top_k_requested": candidate_k,
+                        "candidates_returned": len(candidates),
+                        "distance_metric": "cosine",
+                        "document_filter": list(document_ids) if document_ids else None,
+                        "page_filter": page_number,
+                        "section_filter": section,
+                        "workspace_filter_applied": True,
+                    },
+                )
+        elif trace:
+            trace.skip(
+                "vector_search",
+                "keyword-only (BM25) retrieval ranks by exact terms, "
+                "so the vector index is not queried",
+            )
+
+        if mode in ("bm25", "hybrid"):
+            candidates, fused_hybrid, bm25_ms = self._lexical_search(
+                db,
                 workspace_id=workspace_id,
-                query_embedding=query_vector,
-                top_k=candidate_k,
+                question=question,
+                candidates=candidates,
+                mode=mode,
+                top_k=top_k,
+                candidate_k=candidate_k,
                 document_ids=document_ids,
                 page_number=page_number,
                 section=section,
+                trace=trace,
             )
-        except Exception as exc:
-            logger.exception("Retrieval failed for workspace %s", workspace_id)
-            raise RetrievalError(
-                "The vector search could not be completed.",
-                detail={"reason": exc.__class__.__name__},
-            ) from exc
-        outcome.search_ms = int((time.perf_counter() - search_start) * 1000)
-        outcome.candidates_retrieved = len(candidates)
+            outcome.search_ms += bm25_ms
 
-        if trace:
-            trace.add(
-                "vector_search",
-                status="ok" if candidates else "ok",
-                duration_ms=outcome.search_ms,
-                data={
-                    "workspace_id": workspace_id,
-                    "top_k_requested": candidate_k,
-                    "candidates_returned": len(candidates),
-                    "distance_metric": "cosine",
-                    "document_filter": list(document_ids) if document_ids else None,
-                    "page_filter": page_number,
-                    "section_filter": section,
-                    "workspace_filter_applied": True,
-                },
-            )
+        outcome.candidates_retrieved = len(candidates)
+        outcome.hybrid = fused_hybrid
 
         if not candidates:
             if trace:
                 trace.skip(
                     "candidate_retrieval",
-                    "the vector index returned no candidates for this workspace",
+                    "retrieval returned no candidates for this workspace and scope",
                 )
                 trace.skip("reranking", "there were no candidates to re-rank")
             outcome.total_ms = int((time.perf_counter() - started) * 1000)
@@ -331,30 +415,50 @@ class Retriever:
         outcome.duplicates_removed = duplicates
 
         threshold = settings.min_relevance_score
-        if threshold > 0:
+        # The cosine threshold and the lexical blend are DENSE-specific.
+        # Under bm25 the scores are BM25 numbers, and under hybrid they are
+        # reciprocal-rank values (~0.005-0.03) - filtering either scale at a
+        # cosine cutoff would discard everything (or nothing), and blending a
+        # lexical score into BM25 would double-count the exact-term evidence the
+        # ranking already contains. Both scales are honest; they are just not
+        # comparable, so no cross-scale cutoff is applied.
+        blend_applied = mode == "dense"
+        if threshold > 0 and mode == "dense":
             before = len(candidates)
             candidates = [c for c in candidates if c.score >= threshold]
             outcome.below_threshold = before - len(candidates)
 
-        # Blend in a lexical term BEFORE the final cut, so a chunk that literally
-        # contains "UNIT III" is not discarded for a weak semantic score.
-        #
-        # Called ONCE. It was previously called twice in a row, which re-scored every
-        # candidate against the same question a second time - the blend is not
-        # idempotent, so the second pass silently shifted every score again and the
-        # ranking shown in the trace was not the ranking the first pass produced.
-        candidates = apply_lexical_blend(candidates, question)
+        if mode == "dense":
+            # Blend in a lexical term BEFORE the final cut, so a chunk that literally
+            # contains "UNIT III" is not discarded for a weak semantic score.
+            #
+            # Called ONCE. It was previously called twice in a row, which re-scored every
+            # candidate against the same question a second time - the blend is not
+            # idempotent, so the second pass silently shifted every score again and the
+            # ranking shown in the trace was not the ranking the first pass produced.
+            candidates = apply_lexical_blend(candidates, question)
+        elif mode == "bm25":
+            # `_lexical_search` already put the BM25 score in `score`; keep that order.
+            candidates.sort(key=lambda c: c.score, reverse=True)
+            for position, chunk in enumerate(candidates):
+                chunk.rank = position
+        else:  # hybrid: the order is already decided by the reciprocal-rank fusion
+            candidates.sort(key=lambda c: c.rrf_score or 0.0, reverse=True)
+            for position, chunk in enumerate(candidates):
+                chunk.rank = position
 
         if trace:
             trace.add(
                 "candidate_retrieval",
                 duration_ms=0,
                 data={
+                    "retrieval_mode": mode,
+                    "score_scale": outcome.score_scale,
                     "after_dedup": len(candidates),
                     "duplicates_removed": duplicates,
                     "below_threshold_removed": outcome.below_threshold,
-                    "score_threshold": threshold,
-                    "lexical_blend": True,
+                    "score_threshold": threshold if mode != "hybrid" else None,
+                    "lexical_blend": blend_applied,
                     "near_duplicate_threshold": settings.retrieval_near_duplicate_threshold,
                     "top_score": round(candidates[0].score, 4) if candidates else 0.0,
                     "bottom_score": round(candidates[-1].score, 4) if candidates else 0.0,
@@ -414,6 +518,131 @@ class Retriever:
         return outcome
 
     # ------------------------------------------------------------------ helpers
+    def _lexical_search(
+        self,
+        db: Session,
+        *,
+        workspace_id: int,
+        question: str,
+        candidates: list[RetrievedChunk],
+        mode: str,
+        top_k: int,
+        candidate_k: int,
+        document_ids: Sequence[int] | None,
+        page_number: int | None,
+        section: str | None,
+        trace: TraceRecorder | None,
+    ) -> tuple[list[RetrievedChunk], dict[str, Any], int]:
+        """Run the BM25 side, and fuse it if the mode is hybrid.
+
+        Returns (ranked_candidates, hybrid_report, bm25_ms).
+
+        For mode == "bm25" the candidates ARE the BM25 ranking, and the report
+        still shows what dense found (an empty list, since dense did not run) so
+        the lab's three columns always describe the same three methods and never
+        imply a method ran when it did not.
+
+        For mode == "hybrid" the dense list is already in `candidates` and the
+        BM25 list is computed over the identical population, then fused. The
+        report keeps all three rankings for the trace and the Retrieval Lab.
+        """
+        from app.rag.hybrid import (
+            Bm25Index,
+            HybridOutcome,
+            bm25_corpus_for_workspace,
+            reciprocal_rank_fusion,
+        )
+
+        # --- BM25 over the same scope as dense -------------------------------
+        started = time.perf_counter()
+        corpus = bm25_corpus_for_workspace(
+            db,
+            workspace_id,
+            document_ids=document_ids,
+            page_number=page_number,
+            section=section,
+        )
+        index = Bm25Index.build(corpus, k1=settings.bm25_k1, b=settings.bm25_b)
+        pool = max(candidate_k, top_k)
+        hits = index.search(question, top_k=pool)
+        bm25_ranked: list[RetrievedChunk] = []
+        for position, (chunk, score) in enumerate(hits):
+            chunk.bm25_score = round(score, 4)
+            chunk.bm25_rank = position
+            if mode == "bm25":
+                # BM25-only: this IS the ranking score, so downstream code (dedupe,
+                # top_k cut, the trace) reads one field. In hybrid mode `score` is
+                # left as the chunk's cosine value, because a shared object must not
+                # silently switch scale mid-pipeline.
+                chunk.score = round(score, 4)
+            bm25_ranked.append(chunk)
+        bm25_ms = int((time.perf_counter() - started) * 1000)
+
+        if trace:
+            trace.add(
+                "bm25_search",
+                duration_ms=bm25_ms,
+                data={
+                    "algorithm": "Okapi BM25",
+                    "corpus_size": len(corpus),
+                    "returned": len(bm25_ranked),
+                    "k1": settings.bm25_k1,
+                    "b": settings.bm25_b,
+                    "top_score": round(bm25_ranked[0].bm25_score or 0.0, 4)
+                    if bm25_ranked
+                    else 0.0,
+                    "score_note": (
+                        "BM25 scores are unbounded and comparable only to other "
+                        "BM25 scores - never to a cosine similarity."
+                    ),
+                },
+            )
+
+        if mode == "bm25":
+            return bm25_ranked, {"dense_only": len(candidates), "mode": "bm25"}, bm25_ms
+
+        # --- hybrid: fuse dense (already computed) with bm25 -----------------
+        for chunk in candidates:
+            if chunk.original_score is None:
+                chunk.original_score = chunk.score
+
+        fused = reciprocal_rank_fusion(
+            candidates,
+            bm25_ranked,
+            rrf_k=settings.rrf_k,
+            dense_weight=settings.hybrid_dense_weight,
+        )
+        for position, chunk in enumerate(fused):
+            chunk.rank = position
+
+        if trace:
+            trace.add(
+                "rrf_fusion",
+                duration_ms=0,
+                data={
+                    "method": "Reciprocal Rank Fusion",
+                    "rrf_k": settings.rrf_k,
+                    "dense_weight": settings.hybrid_dense_weight,
+                    "inputs": len(candidates),
+                    "outputs": len(fused),
+                    "note": (
+                        "Ranks are fused by position only; cosine and BM25 are "
+                        "different scales and are never added together. The fused "
+                        "score is a reciprocal-rank value, not a similarity."
+                    ),
+                },
+            )
+
+        report = HybridOutcome(
+            dense=list(candidates),
+            bm25=bm25_ranked,
+            fused=fused,
+            rrf_k=settings.rrf_k,
+            dense_weight=settings.hybrid_dense_weight,
+            bm25_ms=bm25_ms,
+        )
+        return fused, report.as_dict(), bm25_ms
+
     def _join_chunk_rows(
         self, db: Session, candidates: list[RetrievedChunk], workspace_id: int
     ) -> list[RetrievedChunk]:

@@ -176,12 +176,22 @@ class GroqProvider:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Yield Groq's real token deltas, OpenAI-style.
 
         Raises the SAME errors as `generate` so the adapter's fallback rules apply
         identically to a streaming request. That matters: a rate-limited stream must
         advance the chain exactly as a rate-limited completion does.
+
+        A stream that ends with zero fragments raises the same "empty response"
+        `LLMError` the buffered path raises. Without it, an empty provider response
+        would stream nothing, the pipeline would join an empty list, and the route
+        would commit an empty assistant message as if it were an answer.
+
+        `meta`, when provided, receives `finish_reason` so callers can tell
+        `length` truncation apart from a clean stop without parsing the stream
+        twice.
         """
         if not self.configured:
             raise ProviderConfigError("Groq is not configured (GROQ_API_KEY missing).")
@@ -193,6 +203,9 @@ class GroqProvider:
             "max_tokens": max_tokens or settings.groq_max_output_tokens,
             "stream": True,
         }
+
+        fragments = 0
+        finish_reason = ""
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -233,13 +246,22 @@ class GroqProvider:
                         for choice in event.get("choices") or []:
                             delta = (choice.get("delta") or {}).get("content")
                             if delta:
+                                fragments += 1
                                 yield str(delta)
+                            reason = choice.get("finish_reason")
+                            if reason:
+                                finish_reason = str(reason)
         except httpx.TimeoutException as exc:
             raise ProviderUnavailableError("Groq timed out.") from exc
         except httpx.HTTPError as exc:
             raise ProviderUnavailableError(
                 f"Could not reach Groq ({exc.__class__.__name__})."
             ) from exc
+
+        if meta is not None and finish_reason:
+            meta["finish_reason"] = finish_reason
+        if fragments == 0:
+            raise LLMError("Groq returned an empty response.")
 
     # --------------------------------------------------------------- model list
     async def list_models(self) -> list[str]:

@@ -36,6 +36,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Card, CardHeader, Stat } from "@/components/ui/Card";
 import { EmptyState, ErrorState, LoadingPanel } from "@/components/ui/Feedback";
 import { Segmented } from "@/components/ui/Tabs";
+import { AnimatedMetric } from "@/components/motion/AnimatedMetric";
 import {
   BarChartH,
   DonutChart,
@@ -303,38 +304,45 @@ export default function Analytics() {
       />
 
       <PageBody wide className="space-y-6">
-        {/* ---- KPI row ------------------------------------------------ */}
+        {/* ---- KPI row ------------------------------------------------
+            The figures count up as the row scrolls into view. Only the number
+            animates; each is passed its real value and a formatter, so the final
+            rendered string is byte-for-byte what the non-animated Stat would have
+            shown. A KPI that never reached its exact value would be a lie with a
+            nicer entrance. */}
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <Stat
             label="Questions asked"
-            value={formatNumber(overview.data?.queries)}
+            value={<AnimatedMetric value={overview.data?.queries ?? 0} format={(n) => formatNumber(Math.round(n))} />}
             hint="Recorded so they can be measured"
             icon={<MessagesSquare className="h-3.5 w-3.5" />}
           />
           <Stat
             label="Documents"
-            value={formatNumber(overview.data?.documents)}
+            value={<AnimatedMetric value={overview.data?.documents ?? 0} format={(n) => formatNumber(Math.round(n))} />}
             hint={`${formatNumber(overview.data?.chunks)} chunks indexed`}
             icon={<FileText className="h-3.5 w-3.5" />}
           />
           <Stat
             label="Average response time"
-            value={formatDuration(avgResponseMs)}
+            value={<AnimatedMetric value={avgResponseMs ?? 0} format={(n) => formatDuration(Math.round(n))} />}
             hint="End to end, per question"
             icon={<Timer className="h-3.5 w-3.5" />}
           />
           <Stat
             label="Grounded answers"
-            value={formatPercent(
-              grounding.total > 0 ? grounding.supported / grounding.total : undefined,
-              0,
-            )}
+            value={
+              <AnimatedMetric
+                value={(grounding.total > 0 ? (grounding.supported / grounding.total) * 100 : 0)}
+                format={(n) => formatPercent(n / 100, 0)}
+              />
+            }
             hint={`Supported, of ${formatNumber(grounding.total)} answered`}
             icon={<ShieldCheck className="h-3.5 w-3.5" />}
           />
           <Stat
             label="Web searches"
-            value={formatNumber(webSearches)}
+            value={<AnimatedMetric value={webSearches ?? 0} format={(n) => formatNumber(Math.round(n))} />}
             hint="Opt-in, never automatic"
             icon={<Globe className="h-3.5 w-3.5" />}
           />

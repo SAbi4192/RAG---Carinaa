@@ -3,6 +3,7 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Download,
   Languages,
   Minimize2,
   RotateCcw,
@@ -74,7 +75,10 @@ export function AnswerToolbar({
 
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState<"" | "translate" | "shorten" | "explain">("");
-  const [openMenu, setOpenMenu] = useState<"" | "translate" | "shorten">("");
+  const [openMenu, setOpenMenu] = useState<"" | "translate" | "shorten" | "export">("");
+  /** Separate from `busy`: an export is a download, not a mutation of the answer,
+   *  so it must not grey out Translate/Shorten/Explain while it runs. */
+  const [exporting, setExporting] = useState<"" | "md" | "html">("");
   const [speaking, setSpeaking] = useState(false);
   const [explanation, setExplanation] = useState<string | null>(null);
   /**
@@ -122,6 +126,31 @@ export function AnswerToolbar({
       toast.error("Could not copy", "Your browser blocked clipboard access.");
     }
   }, [displayedContent, toast]);
+
+  /* ---- export evidence pack ------------------------------------------ */
+  const handleExport = useCallback(
+    async (format: "md" | "html") => {
+      setOpenMenu("");
+      setExporting(format);
+      try {
+        await api.chat.downloadEvidencePack(message.id, format);
+        toast.success(
+          "Evidence pack saved",
+          format === "html"
+            ? "Open it and use Print → Save as PDF for a PDF."
+            : "Markdown, with the trace, sources and evidence.",
+        );
+      } catch (cause) {
+        toast.error(
+          "Could not export",
+          cause instanceof ApiError ? cause.message : "Please try again.",
+        );
+      } finally {
+        setExporting("");
+      }
+    },
+    [message.id, toast],
+  );
 
   /* ---- translate ----------------------------------------------------- */
   const handleTranslate = useCallback(
@@ -409,6 +438,53 @@ export function AnswerToolbar({
             onClick={onOpenTrace}
           />
         ) : null}
+
+        {/* export - a menu, because the two formats answer two different needs:
+            a portable document (Markdown) and a printable page that becomes a PDF
+            through the browser's own, faithful renderer. */}
+        <div className="relative">
+          <ToolbarButton
+            icon={exporting ? <Spinner size={14} /> : <Download className="h-3.5 w-3.5" />}
+            label="Export"
+            trailing={<ChevronDown className="h-3 w-3" />}
+            active={openMenu === "export"}
+            disabled={exporting !== ""}
+            title="Download the answer with its sources and trace"
+            onClick={() => setOpenMenu(openMenu === "export" ? "" : "export")}
+          />
+
+          {openMenu === "export" ? (
+            <div className="absolute bottom-full left-0 z-30 mb-1.5 w-72 animate-slide-down rounded-lg border border-line bg-raised p-1 shadow-pop">
+              <p className="px-2 py-1.5 text-2xs font-semibold uppercase tracking-wide text-faint">
+                Export evidence pack
+              </p>
+              <button
+                type="button"
+                onClick={() => void handleExport("md")}
+                className="w-full rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-sunken"
+              >
+                <span className="block text-xs text-ink">Markdown (.md)</span>
+                <span className="block text-2xs text-faint">
+                  Question, answer, sources, evidence, trace and provider.
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleExport("html")}
+                className="w-full rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-sunken"
+              >
+                <span className="block text-xs text-ink">Printable page (.html)</span>
+                <span className="block text-2xs text-faint">
+                  Styled for Print → Save as PDF, including citation links.
+                </span>
+              </button>
+              <p className="border-t border-line px-2 pb-1 pt-1.5 text-2xs leading-relaxed text-faint">
+                Assembled from the stored answer and its recorded trace. Nothing is
+                re-run or regenerated for export.
+              </p>
+            </div>
+          ) : null}
+        </div>
       </div>
 
       {/* ---- the simple explanation ---------------------------------

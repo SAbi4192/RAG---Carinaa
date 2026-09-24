@@ -48,9 +48,22 @@ The Learning panel visualises a real run; it is not a simulation. One rule backs
 A trace alone is not treated as proof of success — it may belong to an *earlier* run. So
 the current run's outcome is tracked explicitly, a failed run's trace is dropped, and the
 panel then states the failure and hides the previous run's stages behind an explicit
-"Show … for reference" toggle. A browser test asserts this: one successful query, then a
+"Show ... for reference" toggle. A browser test asserts this: one successful query, then a
 deterministic failure, then confirm the panel says the run did not complete rather than
 showing checkmarks.
+
+---
+
+## Answers stream live — from the provider, not from a typewriter
+
+`POST /api/chat/ask/stream` is real Server-Sent Events. While the answer appears token by
+token as Groq/Gemini/the local model actually produce it, the pipeline stages light up from
+the *same* backend events the trace records — `ready` → `stage` ×N → `token` ×N → `done`.
+Nothing is faked: a mid-stream failure never persists a truncated answer, an empty stream
+fails rather than committing a blank message, and the buffered `/chat/ask` twin shares the
+same prepare/persist code so the two endpoints cannot drift. The answer text is only
+committed to the transcript when `done` arrives, which keeps the canonical message a single
+canonical fact.
 
 ---
 
@@ -60,8 +73,9 @@ The system is also a **RAG learning platform**. You do not have to take anyone's
 how it works — you can watch it, one stage at a time, on your own documents.
 
 - **Learning Mode** (a toggle in Chat) shows the real pipeline beneath every answer.
-- **The RAG Laboratory** (`/app/playground`) has ten benches. Seven follow the stages of
-  one question — chunking, embeddings, vector store, retrieval, context, generation and
+- **The RAG Laboratory** (`/app/playground`) has eleven benches. Eight follow the stages of
+  one question — chunking, embeddings, vector store, retrieval, **hybrid retrieval** (dense,
+  BM25 and RRF over one question, the reordering animated), context, generation and
   the full pipeline. Three more are about what a conversation adds on top: the
   **Reference Lab** (why "page 2" must be a filter, not a search term), the **Scope Lab**
   (how "answer only from this document" is enforced) and the **Memory Lab** (why the
@@ -81,16 +95,34 @@ system.
 
 | | Typical "chat with your PDF" | Carinaa |
 | --- | --- | --- |
-| Citations | "According to your documents" | `[1] cloud_computing_notes.md · 2. Virtualization (0.7309)` |
+| Citations | "According to your documents" | `[1] cloud_computing_notes.md · 2. Virtualization (0.7309)` — and clicking it opens **the exact chunk**, highlighted |
 | Grounding | Not checked | Four verdicts, including **`INSUFFICIENT_EVIDENCE`** |
 | Refusal | Invents an answer | Says "the documents do not cover this" |
+| Generation | Waits, then dumps text | **Streams real provider tokens** with the live RAG pipeline |
+| Retrieval | Hidden | Dense / BM25 / **hybrid RRF** — one retriever setting, compared side by side in the Retrieval Lab |
 | Offline | Requires an API | **Runs with no network at all** — and proves it with tests |
-| Retrieval | Hidden | Inspectable in the Playground, with real scores |
-| Pipeline | A black box | Nine traceable stages with measured durations |
+| Evidence | Lost after the tab closes | **Export Evidence Pack** (Markdown / print-ready PDF) built from stored rows, never re-run |
+| Pipeline | A black box | Nine traceable stages with measured durations, per message |
 
 ---
 
 ## Quick start
+
+### The easy way
+
+Double-click **`Start-Carinaa.bat`** in the project root. It builds the frontend if needed,
+starts the backend, and opens **http://127.0.0.1:8000**. Options:
+
+| Command | What it does |
+| --- | --- |
+| `Start-Carinaa.bat` | Production: one origin, backend serves `frontend/dist` |
+| `Start-Carinaa.bat dev` | Live reload: Vite on :5173 (proxies `/api`) + uvicorn `--reload` on :8000 |
+| `Start-Carinaa.bat test` | Runs the backend test suite |
+
+To stop the production server, close the minimized **"Carinaa server"** window. The script
+quotes the project path, so the `&` in the folder name is not a problem.
+
+### The manual way
 
 Run everything from the **project root** (`RAG - Carinaa/`).
 
@@ -135,19 +167,21 @@ ask: *"How does virtualization improve resource utilization?"*
 
 | Mode | Provider | Internet | API key |
 | --- | --- | --- | --- |
-| **Online** | Gemini → Groq fallback | Required | `GEMINI_API_KEY` |
+| **Online** | **Groq** primary → Gemini fallback | Required | `GROQ_API_KEY` (plus `GEMINI_API_KEY` for fallback) |
 | **Offline** | Local GGUF (llama.cpp) | **Not required** | **Not required** |
 
 `.env` is already configured with both keys. Offline mode needs nothing — it uses
 `models/llm-model.gguf` (2.0 GB), which is already on disk. The mode is chosen **per
-question** in the Playground; it is not a global setting.
+question** in the Playground; it is not a global setting. Whichever provider actually
+answered is recorded on the message, in the trace, and in the badge — a silent swap is
+impossible.
 
 ---
 
 ## Tests
 
 ```bash
-# Backend test suite — 121 fast tests
+# Backend test suite — 270 fast tests
 cd backend && ../.venv/Scripts/python.exe -m pytest -m "not slow"
 
 # Include the tests that load the real 2 GB model
@@ -178,10 +212,10 @@ cd frontend && node node_modules/typescript/bin/tsc --noEmit
 cd frontend && node node_modules/vite/bin/vite.js build
 ```
 
-**Current status: 238 pytest tests passing · 23/23 laboratory checks ·
+**Current status: 270 fast pytest tests passing (+1 slow) · 23/23 laboratory checks ·
 50/50 browser UI checks · 8/8 online RAG checks · 6/6 security self-tests · 0 type drift.**
 
-Providers are chained, not single: if Gemini is rate limited, the next Gemini model is tried before falling through to Groq, and whichever model answered is recorded in the trace.
+Providers are chained, not single: if Groq (primary) is rate limited, the next Groq model is tried before falling through to Gemini, and whichever model answered is recorded in the trace.
 
 ```
 .venv/Scripts/python.exe scripts/verify_online_rag.py   # units, pages, memory live
@@ -323,7 +357,8 @@ frontend/
     lib/          types, api client, formatting, speech
     state/        theme, auth, workspace, toast
     components/   ui primitives, layout, chat, documents, trace
-    pages/        the ten screens
+    pages/        Chat (with Learning Mode), Playground (RAG Laboratory), Knowledge,
+                  DocumentViewer, Analytics, RAG Trace, Settings
 docs/             this documentation set
 scripts/          e2e_test.py, fetch_models.py, inspect_gguf.py, repro_delete.py
 samples/          a sample document to demo with

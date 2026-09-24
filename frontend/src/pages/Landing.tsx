@@ -25,6 +25,7 @@ import {
 import { useTheme } from "@/state/theme";
 import { useAuth } from "@/state/auth";
 import { Logo } from "@/components/brand/Logo";
+import { KnowledgeFlow } from "@/components/brand/KnowledgeFlow";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 
@@ -53,7 +54,7 @@ const PIPELINE_QUERY = [
   { step: "Retrieve", detail: "cosine search, filtered" },
   { step: "Re-rank", detail: "optional, off by default" },
   { step: "Build context", detail: "numbered, budgeted" },
-  { step: "Generate", detail: "Gemini → Groq, or local" },
+  { step: "Generate", detail: "Groq → Gemini, or local" },
   { step: "Ground", detail: "is it actually supported?" },
   { step: "Cite", detail: "resolve [n] → real passage" },
 ];
@@ -206,6 +207,17 @@ export default function Landing() {
             </p>
           </div>
 
+          {/* ---- the knowledge flow: the product's story, moving ---- */}
+          {/* The hero must show what Carinaa does before the reader finishes the
+              sentence that says it. The flow below is the brand motif itself -
+              question, search pulse, documents that light up because they are
+              relevant, evidence gathering into the AI, and a cited answer coming
+              out - with the cursor driving a subtle parallax so the picture
+              responds to the person looking at it. */}
+          <div className="mx-auto mt-10 w-full max-w-4xl">
+            <KnowledgeFlow />
+          </div>
+
           {/* ---- product mockup ---- */}
           <div className="mx-auto mt-14 max-w-3xl animate-fade-up">
             <div className="overflow-hidden rounded-2xl border border-line bg-surface shadow-lifted">
@@ -231,7 +243,7 @@ export default function Landing() {
                       Supported
                     </Badge>
                     <Badge tone="neutral" mono>
-                      Gemini · 1.4 s
+                      Groq · 1.4 s
                     </Badge>
                     <Badge tone="accent" mono>
                       6 chunks retrieved

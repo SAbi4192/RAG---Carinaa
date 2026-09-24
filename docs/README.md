@@ -42,7 +42,23 @@ behind a framework. Every component is explained with the same six questions:
 
 ---
 
+## Interactive diagrams
+
+Self-contained HTML pages (no network, no build) — open them directly in a browser;
+each has a theme toggle and a Print → Save as PDF button for slides.
+
+| Diagram | What it shows |
+| --- | --- |
+| [**System Architecture & Live Workflow**](Carinaa-System-Workflow.html) | The whole system today: ingestion, hybrid retrieval (dense + BM25 → RRF), the streaming SSE protocol, per-message evidence, stage→file map, boundaries |
+| [RAG Chat, Learning Mode & Pipeline Workflow](Carinaa-RAG-Workflow.html) | The conversational surfaces and the Learning panel, drawn per stage |
+| [Architecture overview](Carinaa-Architecture.html) | The layered component view |
+
+---
+
 ## Running it
+
+Easiest: double-click **`Start-Carinaa.bat`** in the project root (see [README](../README.md)).
+Or by hand:
 
 ```bash
 # 1. Backend (from the project root)
@@ -75,7 +91,7 @@ cd backend && ../.venv/Scripts/python.exe -m pytest -m slow
 
 | Mode | Provider | Needs internet? | Needs a key? |
 | --- | --- | --- | --- |
-| **Online** | Gemini primary, Groq fallback | Yes | Yes (`GEMINI_API_KEY`) |
+| **Online** | Groq primary, Gemini fallback | Yes | Yes (`GROQ_API_KEY`, optional `GEMINI_API_KEY`) |
 | **Offline** | Local GGUF via llama.cpp | **No** | **No** |
 
 Offline mode is genuinely offline. It will never silently fall back to an online

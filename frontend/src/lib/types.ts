@@ -478,6 +478,60 @@ export interface RetrieveResponse {
   error?: string;
 }
 
+/* ---- Retrieval Lab: dense vs BM25 vs hybrid ------------------------------ */
+
+export type RetrievalMode = "dense" | "bm25" | "hybrid";
+
+/** One chunk's result entry within a single mode's column. */
+export interface CompareResult {
+  vector_id: string | null;
+  chunk_id: number | null;
+  label: string | null;
+  document_name: string | null;
+  metadata: Record<string, unknown>;
+  rank: number | null;
+  score: number;
+  rrf_score: number | null;
+  bm25_score: number | null;
+  preview: string | null;
+}
+
+/** One retriever's column of results. A mode can also have failed alone. */
+export interface CompareColumn {
+  mode?: RetrievalMode;
+  score_scale?: string;
+  search_ms?: number;
+  results?: CompareResult[];
+  error?: string;
+}
+
+/** One row of the comparison matrix: a chunk, and its rank in every mode. */
+export interface CompareRow {
+  vector_id: string;
+  label: string | null;
+  document_name: string | null;
+  preview: string;
+  ranks: Record<RetrievalMode, number | null>;
+  agreement: number;
+  found_by: RetrievalMode[];
+  best_rank: number;
+}
+
+export interface RetrieveCompareResponse {
+  question: string;
+  columns: Record<RetrievalMode, CompareColumn>;
+  comparison: CompareRow[];
+  stats: {
+    total_unique_chunks: number;
+    found_by_all_three: number;
+    top_disagreements: Array<{
+      label: string | null;
+      document_name: string | null;
+      found_by: RetrievalMode[];
+    }>;
+  };
+}
+
 /* ========================================================================== */
 /* Settings                                                                    */
 /* ========================================================================== */

@@ -20,6 +20,7 @@ import {
   Sparkles,
   Target,
   Terminal,
+  Waypoints,
   XCircle,
   type LucideIcon,
 } from "lucide-react";
@@ -102,8 +103,8 @@ const SIMPLE_STEPS: SimpleStep[] = [
     title: "Search",
     icon: Search,
     simple:
-      "Carinaa searches the knowledge selected for this chat — by meaning, not just by matching words.",
-    stages: ["query_embedding", "vector_search"],
+      "Carinaa searches the knowledge selected for this chat — by meaning, and (in hybrid mode) by exact words too.",
+    stages: ["query_embedding", "vector_search", "bm25_search"],
   },
   {
     id: "find",
@@ -111,7 +112,7 @@ const SIMPLE_STEPS: SimpleStep[] = [
     icon: Target,
     simple:
       "Carinaa compares what it found and keeps the pieces most relevant to your question.",
-    stages: ["candidate_retrieval", "reranking"],
+    stages: ["candidate_retrieval", "rrf_fusion", "reranking"],
   },
   {
     id: "prepare",
@@ -384,6 +385,41 @@ export function LearningPanel({
         score: Number(entry.score ?? 0),
       }))
       .filter((entry) => entry.label || entry.document);
+  }, [stages]);
+
+  /**
+   * The hybrid retrieval summary for this message, from `candidate_retrieval`.
+   *
+   * The server attaches a compact report of BOTH retrievals and their fusion to
+   * that one event whenever hybrid ran, so this panel can draw the real
+   * dense + bm25 -> RRF structure for the exact answer being explained - with
+   * real counts and real labels. It is absent (and the section is not rendered)
+   * for any message retrieved another way; we never show a diagram that did not
+   * happen.
+   */
+  const hybrid = useMemo(() => {
+    const stage = stages.find((item) => item.stage === "candidate_retrieval");
+    const raw = stage?.data?.hybrid as Record<string, unknown> | undefined;
+    if (!raw || !Array.isArray(raw.fused) || raw.fused.length === 0) return null;
+    const side = (value: unknown) =>
+      Array.isArray(value)
+        ? (value as Record<string, unknown>[]).map((entry) => ({
+            label: String(entry.label ?? ""),
+            document: String(entry.document ?? ""),
+            score: Number(entry.score ?? 0),
+          }))
+        : [];
+    return {
+      denseCount: Number(raw.dense_count ?? 0),
+      bm25Count: Number(raw.bm25_count ?? 0),
+      overlap: Number(raw.overlap_count ?? 0),
+      denseOnly: Number(raw.dense_only ?? 0),
+      bm25Only: Number(raw.bm25_only ?? 0),
+      rrfK: raw.rrf_k == null ? null : Number(raw.rrf_k),
+      dense: side(raw.dense),
+      bm25: side(raw.bm25),
+      fused: side(raw.fused),
+    };
   }, [stages]);
 
   const hasTimes = stages.some((stage) => Boolean(stage.created_at));
@@ -984,6 +1020,26 @@ export function LearningPanel({
           </div>
         ) : null}
 
+        {/* ---- the two-retriever flow, from THIS message's real hybrid run ---- */}
+        {hybrid ? (
+          <div className="mt-4 rounded-xl border border-line bg-surface">
+            <div className="flex w-full items-center gap-2 px-3 py-2.5">
+              <Waypoints className="h-3.5 w-3.5 text-muted" />
+              <span className="flex-1 text-2xs font-medium text-ink">
+                How the evidence was found — two searches, then fusion
+              </span>
+            </div>
+            <div className="border-t border-line px-3 py-3">
+              <p className="text-2xs leading-relaxed text-muted">
+                This answer was retrieved <strong className="text-ink">hybrid</strong>: the
+                system searched by meaning <em>and</em> by exact words, then merged the two
+                rankings. Every number below is from this run.
+              </p>
+              <HybridFlowDiagram hybrid={hybrid} />
+            </div>
+          </div>
+        ) : null}
+
 
         {/* ---- translate this explanation: opt-in and compact ------------- */}
         {hasAnyRun ? (
@@ -1203,6 +1259,124 @@ function StepStatusIcon({ status }: { status: StepStatus }) {
     );
   }
   return <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-positive" />;
+}
+
+function HybridFlowDiagram({
+  hybrid,
+}: {
+  hybrid: {
+    denseCount: number;
+    bm25Count: number;
+    overlap: number;
+    denseOnly: number;
+    bm25Only: number;
+    rrfK: number | null;
+    dense: { label: string; document: string; score: number }[];
+    bm25: { label: string; document: string; score: number }[];
+    fused: { label: string; document: string; score: number }[];
+  };
+}) {
+  const branches: {
+    key: "dense" | "bm25";
+    title: string;
+    hint: string;
+    tone: string;
+    count: number;
+    items: { label: string; document: string; score: number }[];
+  }[] = [
+    {
+      key: "dense",
+      title: "By meaning",
+      hint: "vector search",
+      tone: "text-brand border-brand/30 bg-brand/[0.06]",
+      count: hybrid.denseCount,
+      items: hybrid.dense,
+    },
+    {
+      key: "bm25",
+      title: "By exact words",
+      hint: "keyword search (BM25)",
+      tone: "text-accent border-accent/30 bg-accent/[0.06]",
+      count: hybrid.bm25Count,
+      items: hybrid.bm25,
+    },
+  ];
+
+  return (
+    <div className="mt-3 space-y-2.5">
+      <div className="flex justify-center">
+        <span className="rounded-lg border border-line bg-sunken px-2.5 py-1 text-2xs font-medium text-ink">
+          your question
+        </span>
+      </div>
+
+      {/* the split into the two searches */}
+      <div className="mx-auto h-3 w-px bg-line" aria-hidden />
+      <div className="grid grid-cols-2 gap-2.5">
+        {branches.map((branch) => (
+          <div
+            key={branch.key}
+            className={cn("rounded-lg border px-2.5 py-2", branch.tone)}
+          >
+            <div className="flex items-center justify-between gap-1">
+              <p className="text-2xs font-semibold">{branch.title}</p>
+              <span className="font-mono text-[0.625rem] opacity-80">{branch.count}</span>
+            </div>
+            <p className="text-[0.625rem] opacity-70">{branch.hint}</p>
+            <ul className="mt-1.5 space-y-0.5">
+              {branch.items.slice(0, 3).map((item, index) => (
+                <li key={`${branch.key}-${item.label}-${index}`} className="flex gap-1 text-[0.625rem]">
+                  <span className="shrink-0 font-mono opacity-90">[{item.label}]</span>
+                  <span className="truncate opacity-70">{item.document}</span>
+                </li>
+              ))}
+              {branch.items.length === 0 ? (
+                <li className="text-[0.625rem] italic opacity-60">found nothing</li>
+              ) : null}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      {/* the merge */}
+      <div className="mx-auto h-3 w-px bg-line" aria-hidden />
+      <div className="flex justify-center">
+        <div className="rounded-lg border border-line bg-surface px-3 py-1.5 text-center">
+          <p className="text-2xs font-medium text-ink">
+            Rank fusion{" "}
+            {hybrid.rrfK !== null ? (
+              <span className="font-mono text-faint">(RRF, k={hybrid.rrfK})</span>
+            ) : null}
+          </p>
+          <p className="text-[0.625rem] leading-relaxed text-faint">
+            {hybrid.overlap} in both · {hybrid.denseOnly} meaning-only ·{" "}
+            {hybrid.bm25Only} keyword-only
+          </p>
+        </div>
+      </div>
+
+      {/* the merged result the model received */}
+      <div className="mx-auto h-3 w-px bg-line" aria-hidden />
+      <div className="rounded-lg border border-positive/25 bg-positive/[0.06] px-2.5 py-2">
+        <p className="text-2xs font-semibold text-positive">Best evidence, ordered</p>
+        <ul className="mt-1.5 flex flex-wrap gap-1.5">
+          {hybrid.fused.slice(0, 6).map((item, index) => (
+            <li
+              key={`fused-${item.label}-${index}`}
+              title={`${item.document} · reciprocal-rank ${item.score}`}
+              className="rounded-md border border-line bg-surface px-1.5 py-0.5 font-mono text-[0.625rem] text-ink"
+            >
+              [{item.label}]
+            </li>
+          ))}
+        </ul>
+        <p className="mt-1.5 text-[0.625rem] leading-relaxed text-faint">
+          These are the [n] numbers cited in the answer, after the two searches were
+          merged by position — not by adding scores that live on different scales.
+        </p>
+      </div>
+    </div>
+  );
 }
 
 export default LearningPanel;

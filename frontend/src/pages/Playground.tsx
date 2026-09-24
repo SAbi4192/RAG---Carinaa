@@ -4,6 +4,7 @@ import {
   Braces,
   Database,
   FlaskConical,
+  GitCompareArrows,
   Layers,
   MessageSquareText,
   Scissors,
@@ -21,6 +22,7 @@ import ChunkingLab from "./labs/ChunkingLab";
 import ContextLab from "./labs/ContextLab";
 import EmbeddingLab from "./labs/EmbeddingLab";
 import GenerationLab from "./labs/GenerationLab";
+import HybridLab from "./labs/HybridLab";
 import MemoryLab from "./labs/MemoryLab";
 import PipelineLab from "./labs/PipelineLab";
 import ReferenceLab from "./labs/ReferenceLab";
@@ -85,6 +87,14 @@ const LABS: LabDefinition[] = [
     blurb: "Search with generation switched off and judge the evidence.",
     icon: ScanSearch,
     shows: "which chunks were found, and how close they were",
+    needsWorkspace: true,
+  },
+  {
+    slug: "hybrid",
+    title: "Hybrid Retrieval",
+    blurb: "One question through dense, BM25 and their fusion — watch the ranking reorganise.",
+    icon: GitCompareArrows,
+    shows: "what meaning-only search would have missed, and how RRF recovers it",
     needsWorkspace: true,
   },
   {
@@ -157,6 +167,8 @@ export default function Playground() {
         return <VectorStoreLab />;
       case "retrieval":
         return <RetrievalLab />;
+      case "hybrid":
+        return <HybridLab />;
       case "context":
         return <ContextLab />;
       case "generation":
@@ -186,10 +198,11 @@ function LaboratoryDashboard() {
           RAG Laboratory
         </h1>
         <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted">
-          Ten benches: seven stages of the pipeline, plus three on how a conversation changes the search. Each one runs the{" "}
+          {LABS.length} benches: the stages of the pipeline, the retrievers behind them, and the parts a
+          conversation adds. Each one runs the{" "}
           <strong className="text-ink">same code the real pipeline runs</strong> — nothing here is
           a simulation, so what you measure is what the system does. Start with Chunking if you are
-          new; the stages are listed in the order they execute.
+          new; the stages are listed in the order the pipeline runs them.
         </p>
       </div>
 

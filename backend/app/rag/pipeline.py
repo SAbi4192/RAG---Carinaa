@@ -91,6 +91,9 @@ class RAGAnswer:
     generation_ms: int = 0
     total_ms: int = 0
     token_usage: dict[str, Any] = field(default_factory=dict)
+    # True when a streamed provider reported MAX_TOKENS/LENGTH, so an answer cut
+    # short by the output budget is never silently presented as complete.
+    stream_truncated: bool = False
 
     # Retrieval + grounding
     retrieval: RetrievalOutcome | None = None
@@ -325,6 +328,7 @@ class RAGPipeline:
                 evidence_excerpts,
                 citation_report,
                 top_score=prepared.retrieval.top_score,
+                score_scale=prepared.retrieval.score_scale,
             )
             info.update(
                 {
@@ -515,6 +519,15 @@ class RAGPipeline:
                 parts.append(fragment)
                 yield {"type": "delta", "text": fragment}
 
+            # A stream that ended with no text is a failed generation, not an empty
+            # answer. The provider-level stream guards already raise for a truly
+            # blank response; this is the final safety net for any provider that
+            # ends a 200 stream without ever emitting a fragment. Committing an
+            # empty assistant message as a complete answer is precisely the failure
+            # the honesty rules forbid, and the trace must show it as a failure.
+            if not parts and not result.is_extractive_failsafe:
+                raise LLMError("The model produced no text before its stream ended.")
+
             result.answer = "".join(parts)
             result.provider = str(meta.get("provider", ""))
             result.model = str(meta.get("model", ""))
@@ -523,7 +536,15 @@ class RAGPipeline:
             result.primary_attempted = str(meta.get("primary_attempted", ""))
             # Usage is not reported by a streaming provider, so nothing is invented:
             # the trace records that the run was streamed instead of a token count.
-            result.token_usage = {"streamed": True}
+            # The finish reason IS reported where the provider supplies it, so a
+            # length-truncated answer is visibly marked rather than quietly passed
+            # off as complete.
+            finish_reason = str(meta.get("finish_reason", ""))
+            result.token_usage = {
+                "streamed": True,
+                **({"finish_reason": finish_reason} if finish_reason else {}),
+            }
+            result.stream_truncated = finish_reason.upper() in {"LENGTH", "MAX_TOKENS"}
 
             if trace:
                 trace.add(
@@ -536,6 +557,8 @@ class RAGPipeline:
                         "role": meta.get("role", "primary"),
                         "used_fallback": result.used_fallback,
                         "streamed": True,
+                        **({"finish_reason": finish_reason} if finish_reason else {}),
+                        "truncated": result.stream_truncated,
                         "note": (
                             "The answer was streamed token by token as the model "
                             "produced it. Token counts are not reported by a "
@@ -639,12 +662,14 @@ async def retrieve_only(
     page_number: int | None = None,
     section: str | None = None,
     use_rerank: bool | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Run retrieval and context building, but never call an LLM.
 
     This is what makes the Playground genuinely useful for teaching: you can show
     the retrieval step in isolation, with real scores, without paying for or
-    waiting on a generation.
+    waiting on a generation. `mode` selects the retriever (dense / bm25 / hybrid)
+    so the Retrieval Lab can compare all three over the same question.
     """
     trace = TraceRecorder()
     retriever = get_retriever()
@@ -661,6 +686,7 @@ async def retrieve_only(
             document_ids=document_ids,
             use_rerank=use_rerank,
             trace=trace,
+            mode=mode,
         )
     except RetrievalError as exc:
         return {"error": exc.message, "error_code": exc.code}

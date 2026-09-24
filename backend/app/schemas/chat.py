@@ -307,6 +307,10 @@ class RetrieveRequest(BaseModel):
     # way, so a lab result cannot differ from what a real answer would search.
     page_number: int | None = Field(default=None, ge=1, le=10000)
     section: str | None = None
+    # Optional retriever mode, so the Retrieval Lab can demonstrate dense / bm25 /
+    # hybrid over the SAME question and scope a real answer would use. None means
+    # "use the configured default", identical to the pipeline.
+    mode: str | None = Field(default=None)
 
 
 class RetrieveResponse(BaseModel):

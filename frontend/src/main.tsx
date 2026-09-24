@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 
 import App from "@/App";
 import "@/index.css";
+import { registerServiceWorker } from "@/lib/pwa";
 
 import { AuthProvider } from "@/state/auth";
 import { ThemeProvider } from "@/state/theme";
@@ -40,3 +41,7 @@ createRoot(root).render(
     </ThemeProvider>
   </StrictMode>,
 );
+
+/* Registered last so a failed service-worker step can never block rendering.
+   The helper itself skips non-secure contexts and non-production builds. */
+registerServiceWorker();

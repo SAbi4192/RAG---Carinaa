@@ -134,6 +134,27 @@ class Settings(BaseSettings):
     candidate_k: int = 30
     min_relevance_score: float = 0.0  # 0 disables the threshold
 
+    # ------------------------------------------------- hybrid retrieval ---
+    # Which retriever ranks the candidates handed to the model.
+    #   dense   cosine similarity over the embedding index (the default, and
+    #           the only mode that existed before hybrid was added - so every
+    #           prior answer is unchanged unless this is switched)
+    #   bm25    Okapi BM25 over the same chunk population (exact terms)
+    #   hybrid  dense + bm25 fused by Reciprocal Rank Fusion
+    # The Retrieval Lab runs all three over one question and shows the
+    # orderings side by side, which is the only way to see WHY hybrid exists.
+    retrieval_mode: Literal["dense", "bm25", "hybrid"] = "dense"
+    # RRF's only parameter. 60 is the published default: it flattens the very
+    # top ranks so a first-vs-second place gap does not dominate the fusion.
+    rrf_k: int = 60
+    # BM25 tuning, exposed so the lab can demonstrate the effect rather than
+    # hide it. k1 = term-frequency saturation, b = length normalisation.
+    bm25_k1: float = 1.5
+    bm25_b: float = 0.75
+    # Weight given to the dense list in weighted RRF (BM25 gets 1 - this).
+    # 0.5 is ordinary unweighted RRF.
+    hybrid_dense_weight: float = 0.5
+
     # Chunks whose word sets overlap at least this much are treated as the same
     # evidence. Needed because the same document uploaded twice, or as both a PDF
     # and an exported Markdown file, produces text that differs in whitespace and

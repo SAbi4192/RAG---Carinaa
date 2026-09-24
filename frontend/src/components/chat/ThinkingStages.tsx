@@ -56,6 +56,7 @@ export function ThinkingStages({
   className,
   offline = false,
   animate = true,
+  liveStage = null,
 }: {
   className?: string;
   /** Offline runs the local model, which is genuinely slow; say so plainly. */
@@ -67,9 +68,58 @@ export function ThinkingStages({
    * names are educational ornament. They belong in Learning Mode only.
    */
   animate?: boolean;
+  /**
+   * The name of the pipeline stage the SERVER just reported, when a live stream
+   * is running. When present, it replaces the timed guess entirely: the line says
+   * what is actually happening now rather than cycling on a timer, so a slow or
+   * out-of-order stage never shows the wrong name. It is the single field that
+   * makes this waiting line honest while a stream is in progress.
+   */
+  liveStage?: string | null;
 }) {
   const reduced = usePrefersReducedMotion();
   const [index, setIndex] = useState(0);
+
+  // This effect MUST run before any early return below. A hook placed after a
+  // conditional return changes the hook order between renders (present on one
+  // render, absent the next), which React rejects outright and which silently
+  // corrupts state. Advancing the timer while a real stage name is shown is
+  // harmless: when `liveStage` is set the timer's output is never rendered.
+  useEffect(() => {
+    if (reduced || liveStage) return;
+    if (index >= STAGES.length - 1) return;
+    const timer = window.setTimeout(
+      () => setIndex((current) => Math.min(current + 1, STAGES.length - 1)),
+      STAGE_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [index, reduced, liveStage]);
+
+  // A real stage name from the stream always wins over the timer. This is the
+  // difference between "we think it's about here" and "the server just told us".
+  if (liveStage) {
+    return (
+      <div className={cn("flex items-center gap-3 text-xs text-muted", className)}>
+        <Spinner size={14} />
+        <span
+          key={liveStage}
+          className="animate-fade-up font-medium text-ink"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {liveStage}
+        </span>
+        <span className="flex gap-0.5" aria-hidden>
+          <span className="h-1 w-1 animate-pulse rounded-full bg-brand" />
+          <span className="h-1 w-1 animate-pulse rounded-full bg-brand" style={{ animationDelay: "150ms" }} />
+          <span className="h-1 w-1 animate-pulse rounded-full bg-brand" style={{ animationDelay: "300ms" }} />
+        </span>
+        {offline ? (
+          <span className="text-2xs text-faint">The local model can take 30 seconds or more on a laptop.</span>
+        ) : null}
+      </div>
+    );
+  }
 
   // Static wording for Chat (and for reduced motion, or when animation is off).
   if (!animate || reduced) {
@@ -77,22 +127,12 @@ export function ThinkingStages({
       <div className={cn("flex items-center gap-3 text-xs text-muted", className)}>
         <Spinner size={14} />
         <span>
-          {animate ? "Working through the pipeline…" : "Retrieving and generating…"}
+          {animate ? "Working through the pipeline..." : "Retrieving and generating..."}
           {offline ? " The local model can take 30 seconds or more on a laptop." : ""}
         </span>
       </div>
     );
   }
-
-  useEffect(() => {
-    if (reduced) return;
-    if (index >= STAGES.length - 1) return;
-    const timer = window.setTimeout(
-      () => setIndex((current) => Math.min(current + 1, STAGES.length - 1)),
-      STAGE_MS,
-    );
-    return () => window.clearTimeout(timer);
-  }, [index, reduced]);
 
   const current = STAGES[Math.min(index, STAGES.length - 1)];
   const done = index >= STAGES.length - 1;

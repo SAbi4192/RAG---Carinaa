@@ -210,12 +210,18 @@ class GeminiProvider:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> AsyncIterator[str]:
         """Yield Gemini's real token deltas via `streamGenerateContent`.
 
         Gemini streams with `?alt=sse`, which returns the same SSE framing Groq uses,
         so the payload parsing differs only in where the text lives
         (candidates[0].content.parts[].text instead of choices[0].delta.content).
+
+        A stream that yields no visible text raises the same "empty response" error
+        the buffered path raises - a safety block or a thought-only stream must not
+        become a blank committed answer. The finish reason is reported through
+        `meta` so a `MAX_TOKENS` truncation is distinguishable from a clean stop.
         """
         if not self.configured:
             raise ProviderConfigError("Gemini is not configured (GEMINI_API_KEY missing).")
@@ -240,6 +246,9 @@ class GeminiProvider:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
         url = f"{self.base_url}/models/{self.model}:streamGenerateContent"
+
+        fragments = 0
+        finish_reason = ""
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -273,13 +282,37 @@ class GeminiProvider:
                             continue
                         text = self._extract_stream_text(event)
                         if text:
+                            fragments += 1
                             yield text
+                        reason = self._extract_finish_reason(event)
+                        if reason:
+                            finish_reason = reason
         except httpx.TimeoutException as exc:
             raise ProviderUnavailableError("Gemini timed out.") from exc
         except httpx.HTTPError as exc:
             raise ProviderUnavailableError(
                 f"Could not reach Gemini ({exc.__class__.__name__})."
             ) from exc
+
+        if meta is not None and finish_reason:
+            meta["finish_reason"] = finish_reason
+        if fragments == 0:
+            raise LLMError("Gemini returned an empty response.")
+
+    @staticmethod
+    def _extract_finish_reason(data: dict[str, Any]) -> str:
+        """The first candidate's finishReason, if this chunk carries one.
+
+        Gemini only sends the reason on the terminal chunk (and on a safety block
+        it sends it with no text). Capturing it lets the streaming path mark a
+        MAX_TOKENS-truncated answer instead of reporting a cut-off as complete.
+        """
+        candidates = data.get("candidates") or []
+        if not candidates:
+            prompt_feedback = data.get("promptFeedback") or {}
+            blocked = prompt_feedback.get("blockReason")
+            return f"SAFETY:{blocked}" if blocked else ""
+        return str(candidates[0].get("finishReason", "") or "")
 
     def _extract_stream_text(self, data: dict[str, Any]) -> str:
         """Visible text from one streamed chunk, excluding reasoning parts.

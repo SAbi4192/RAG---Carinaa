@@ -31,7 +31,8 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -53,6 +54,7 @@ from app.db.models import (
     utcnow,
 )
 from app.rag.pipeline import RAGAnswer, get_rag_pipeline, retrieve_only
+from app.rag.export import build_html, build_markdown
 from app.rag.sections import detect_relative_section, match_section
 from app.rag.units import match_unit_section
 from app.rag.references import (
@@ -662,6 +664,35 @@ def _annotate_trace(ctx: _AskContext, result: RAGAnswer) -> None:
                 }
                 for chunk in retrieved_chunks[:6]
             ]
+
+        # The hybrid diagram, in compact form. Learning Mode draws the real
+        # three-stage structure (dense list + bm25 list -> RRF -> order) from
+        # this. Only the top few labels per side are carried here because every
+        # trace event row is stored; the full three rankings live on the message
+        # row's `retrieval` JSON, which the Retrieval surfaces read.
+        hybrid = (result.retrieval.hybrid if result.retrieval else {}) or {}
+        if hybrid and hybrid.get("fused"):
+            def _side(entries: list[dict], limit: int = 4) -> list[dict]:
+                return [
+                    {
+                        "label": entry.get("label"),
+                        "document": entry.get("document_name"),
+                        "score": entry.get("score"),
+                    }
+                    for entry in (entries or [])[:limit]
+                ]
+
+            event.data["hybrid"] = {
+                "dense_count": hybrid.get("dense_count", 0),
+                "bm25_count": hybrid.get("bm25_count", 0),
+                "overlap_count": hybrid.get("overlap_count", 0),
+                "dense_only": hybrid.get("dense_only", 0),
+                "bm25_only": hybrid.get("bm25_only", 0),
+                "rrf_k": hybrid.get("rrf_k"),
+                "dense": _side(hybrid.get("dense")),
+                "bm25": _side(hybrid.get("bm25")),
+                "fused": _side(hybrid.get("fused")),
+            }
         if ctx.requested_page is not None:
             event.data.update(
                 {
@@ -917,13 +948,36 @@ async def ask_stream(
     loop = asyncio.get_running_loop()
     events: asyncio.Queue = asyncio.Queue()
 
+    def _emit(item: dict[str, Any]) -> None:
+        """Push one event onto the stream queue from any thread.
+
+        Two different threads legitimately produce events here:
+          - the retriever runs on a worker thread (pipeline._prepare awaits
+            asyncio.to_thread), so its trace events arrive off-loop; and
+          - generation-stage events (llm_generation, citation_resolution,
+            grounding) and the token deltas arrive on the loop thread itself.
+
+        `call_soon_threadsafe` is required for the off-loop case but WRONG for
+        the on-loop case: it defers the push to the next loop iteration, so a
+        fast synchronous producer (all the stages, then all the tokens, before
+        the consumer ever suspends) queues every token directly while the
+        stage callbacks sit unscheduled - and the consumer reaches the terminal
+        frame and stops before they ever run. Detection is therefore explicit:
+        on the loop thread, push now (correct FIFO, stages precede tokens); off
+        it, hop threads safely. This is why a streamed answer shows its pipeline
+        lighting up in real time rather than only ever showing the tokens.
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            events.put_nowait(item)
+        else:
+            loop.call_soon_threadsafe(events.put_nowait, item)
+
     def _push_stage(event: Any) -> None:
-        # `event` may be emitted from the retriever's worker thread
-        # (`asyncio.to_thread(retriever.retrieve, ...)`). `call_soon_threadsafe`
-        # works uniformly from the loop thread and from a worker thread, so
-        # there is only one path.
-        loop.call_soon_threadsafe(
-            events.put_nowait,
+        _emit(
             {
                 "type": "stage",
                 "seq": event.seq,
@@ -933,11 +987,12 @@ async def ask_stream(
                 "duration_ms": event.duration_ms,
                 "data": event.data,
                 "created_at": event.created_at.isoformat() if event.created_at else None,
-            },
+            }
         )
 
     def _push_pipeline(kind: str, **payload: Any) -> None:
-        events.put_nowait({"type": kind, **payload})
+        _emit({"type": kind, **payload})
+
 
     ctx.trace.subscribe(_push_stage)
 
@@ -1094,6 +1149,7 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         page_number=requested_page,
         section=section_filter,
         use_rerank=payload.use_rerank,
+        mode=payload.mode,
     )
 
     if "error" in outcome:
@@ -1109,6 +1165,166 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         note=str(outcome.get("note", "")),
     )
 
+
+# ---------------------------------------------------------------------------
+# Retrieval Lab: dense vs BM25 vs hybrid, one question, side by side
+# ---------------------------------------------------------------------------
+class RetrieveCompareRequest(BaseModel):
+    workspace_id: int
+    question: str = Field(min_length=1, max_length=4000)
+    top_k: int | None = Field(default=None, ge=1, le=20)
+    candidate_k: int | None = Field(default=None, ge=1, le=200)
+    document_ids: list[int] | None = None
+    conversation_id: int | None = None
+
+
+@router.post("/chat/retrieve/compare")
+async def retrieve_compare(
+    payload: RetrieveCompareRequest, user: CurrentUser, db: DbSession
+) -> dict:
+    """Run the SAME retrieval three times - dense, bm25, hybrid - and compare.
+
+    WHY ONE ENDPOINT AND NOT THREE CLIENT CALLS. The comparison is only
+    meaningful when all three modes see an identical population: same workspace,
+    same chat scope, same question. Resolving that scope once server-side and
+    running all three here is what guarantees the three columns of the lab are
+    literally comparable. Three client calls could drift if, say, a document was
+    re-indexed between them.
+
+    The three runs are concurrent (asyncio.gather over to_thread), which is both
+    faster and keeps the comparison tight in time.
+
+    What the response carries, per mode: the ordered result list with each
+    chunk's score on that mode's own scale, plus a `movements` table showing
+    where each chunk ranked in each mode. The UI animates the reorganisation
+    from that table; nothing here guesses at what the animation will show - it
+    reports the actual ranks, and a chunk that appears in one mode but not the
+    other is listed as such rather than padded to look common.
+    """
+    workspace = _require_workspace(db, user, payload.workspace_id)
+
+    scope: list[int] | None = payload.document_ids
+    if scope is None and payload.conversation_id is not None:
+        conversation = _require_conversation(db, user, payload.conversation_id)
+        if conversation.workspace_id != workspace.id:
+            raise NotFound("That conversation is not in this workspace.")
+        scope = _resolve_retrieval_scope(db, conversation.id, None)
+
+    requested_page = detect_page_reference(payload.question)[0]
+    section_filter = match_unit_section(
+        payload.question, _scope_sections(db, scope, workspace.id)
+    )
+
+    modes = ("dense", "bm25", "hybrid")
+    # SEQUENTIAL, deliberately. Each retrieve_only call hands the SAME
+    # request-scoped Session to `asyncio.to_thread`, and a SQLAlchemy Session is
+    # not safe for concurrent use from several worker threads. A gather here
+    # would race three retrievals over one connection - faster on paper, and
+    # exactly the kind of subtle, intermittent corruption this project refuses.
+    # A lab is measured in a second or two, not in milliseconds.
+    outcomes = [
+        await retrieve_only(
+            db,
+            workspace_id=workspace.id,
+            question=payload.question,
+            top_k=payload.top_k,
+            candidate_k=payload.candidate_k,
+            document_ids=scope,
+            page_number=requested_page,
+            section=section_filter,
+            use_rerank=False,  # the lab compares RETRIEVERS, not re-rankers
+            mode=mode,
+        )
+        for mode in modes
+    ]
+
+    columns: dict[str, Any] = {}
+    # A chunk's rank in each mode, keyed by vector_id. A chunk missing from a
+    # mode is None there - never -1 or a padded zero, which would imply it was
+    # ranked last when it simply was not retrieved.
+    rank_matrix: dict[str, dict[str, int | None]] = {}
+    label_by_key: dict[str, dict[str, Any]] = {}
+
+    for mode, outcome in zip(modes, outcomes):
+        if "error" in outcome:
+            columns[mode] = {"error": outcome["error"]}
+            continue
+        retrieval = outcome.get("retrieval", {}) or {}
+        chunks = retrieval.get("chunks", [])
+        columns[mode] = {
+            "mode": retrieval.get("mode", mode),
+            "score_scale": retrieval.get("score_scale", ""),
+            "search_ms": retrieval.get("search_ms", 0),
+            "results": [
+                {
+                    "vector_id": c.get("vector_id"),
+                    "chunk_id": c.get("chunk_id"),
+                    "label": c.get("label"),
+                    "document_name": c.get("document_name"),
+                    "metadata": c.get("metadata") or {},
+                    "rank": c.get("rank"),
+                    "score": c.get("score"),
+                    "rrf_score": c.get("rrf_score"),
+                    "bm25_score": c.get("bm25_score"),
+                    "preview": c.get("preview"),
+                }
+                for c in chunks
+            ],
+        }
+        for c in columns[mode]["results"]:
+            key = c.get("vector_id") or f"chunk:{c.get('chunk_id')}"
+            rank_matrix.setdefault(key, {m: None for m in modes})[mode] = c["rank"]
+            label_by_key.setdefault(key, c)
+
+    # The comparison table: one row per chunk any mode found. Sorted by the
+    # smallest rank it achieved anywhere (so the most contested evidence is at
+    # the top), then by name. Each row shows the rank in every mode and which
+    # modes agreed. This is the actual data the animation reorders; the UI adds
+    # no opinion of its own.
+    rows = []
+    for key, ranks in rank_matrix.items():
+        present_in = [m for m in modes if ranks[m] is not None]
+        row = {
+            "vector_id": key,
+            "label": label_by_key[key].get("label"),
+            "document_name": label_by_key[key].get("document_name"),
+            "preview": (label_by_key[key].get("preview") or "")[:140],
+            "ranks": ranks,
+            "agreement": len(present_in),
+            "found_by": present_in,
+            "best_rank": min(v for v in ranks.values() if v is not None),
+        }
+        rows.append(row)
+    rows.sort(key=lambda r: (r["best_rank"], r["label"] or ""))
+
+    # Headline numbers the lab shows under the animation. All counts, all real:
+    # how many chunks the two retrievers agreed on, and the single biggest
+    # disagreement (a chunk one mode ranked first that the other did not
+    # retrieve at all).
+    both = sum(1 for r in rows if r["agreement"] == len(modes))
+    only_one = [
+        r
+        for r in rows
+        if r["agreement"] == 1 and r["best_rank"] == 0
+    ]
+
+    return {
+        "question": payload.question,
+        "columns": columns,
+        "comparison": rows,
+        "stats": {
+            "total_unique_chunks": len(rows),
+            "found_by_all_three": both,
+            "top_disagreements": [
+                {
+                    "label": r["label"],
+                    "document_name": r["document_name"],
+                    "found_by": r["found_by"],
+                }
+                for r in only_one[:6]
+            ],
+        },
+    }
 
 # ---------------------------------------------------------------------------
 # Trace
@@ -1168,3 +1384,80 @@ def delete_message(message_id: int, user: CurrentUser, db: DbSession) -> None:
     message = _require_message(db, user, message_id)
     db.delete(message)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Evidence Pack export (#54)
+# ---------------------------------------------------------------------------
+@router.get("/messages/{message_id}/export")
+def export_evidence_pack(
+    message_id: int,
+    user: CurrentUser,
+    db: DbSession,
+    format: str = Query(default="md", pattern="^(md|html)$"),
+    base_url: str | None = Query(default=None, max_length=300),
+) -> Response:
+    """Download the answer with everything that produced it, as a pack.
+
+    Everything is read from the STORED message and its recorded trace. The export
+    never re-runs retrieval or generation - see app/rag/export.py for why that
+    would be dishonest: a regenerated pack would look authoritative and be wrong.
+
+    `html` is print-ready (the browser's Print -> Save as PDF renders it to a real
+    PDF); `md` is the same content as Markdown. The route does not claim to emit a
+    PDF it has not laid out.
+    """
+    message = _require_message(db, user, message_id)
+    question = _question_for(db, message)
+
+    events = db.scalars(
+        select(TraceEvent)
+        .where(TraceEvent.message_id == message_id)
+        .order_by(TraceEvent.seq)
+    ).all()
+    trace_events = [
+        {
+            "seq": event.seq,
+            "stage": event.stage,
+            "label": (event.event_data or {}).get("label", event.stage.replace("_", " ").title()),
+            "status": event.status,
+            "duration_ms": event.duration_ms,
+        }
+        for event in events
+    ]
+
+    common = {
+        "question": question,
+        "answer": message.content,
+        "provider": message.provider or "",
+        "model": message.model or "",
+        "used_fallback": bool(message.used_fallback),
+        "fallback_reason": message.fallback_reason or "",
+        "is_extractive": (message.model or "") == "extractive",
+        "ai_mode": message.ai_mode or "online",
+        "grounding": message.grounding_detail or None,
+        "citations": message.citations or [],
+        "retrieval": message.retrieval or None,
+        "web_sources": message.web_sources or [],
+        "trace_events": trace_events,
+        "created_at": message.created_at,
+        "latency_ms": message.latency_ms or 0,
+        "base_url": base_url,
+    }
+
+    if format == "html":
+        html_kwargs = {k: v for k, v in common.items() if k != "fallback_reason"}
+        body = build_html(**html_kwargs)
+        media_type = "text/html; charset=utf-8"
+        extension = "html"
+    else:
+        body = build_markdown(**common)
+        media_type = "text/markdown; charset=utf-8"
+        extension = "md"
+
+    filename = f"carinaa-evidence-{message_id}.{extension}"
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

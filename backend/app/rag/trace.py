@@ -110,7 +110,7 @@ class TraceEvent:
         return {
             "seq": self.seq,
             "stage": self.stage,
-            "label": self.label or _STAGE_LABELS.get(self.stage, self.stage.replace("_", " ").title()),
+            "label": self.label or _label_for(self.stage),
             "status": self.status,
             "duration_ms": self.duration_ms,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -118,10 +118,35 @@ class TraceEvent:
         }
 
 
-_STAGE_LABELS: dict[str, str] = {
+_STAGE_LABELS: dict[str, dict[str, Any] | str] = {
     "query_analysis": "Query Analysis",
     "query_embedding": "Query Embedding",
     "vector_search": "Vector Search",
+    "bm25_search": {
+        "label": "Keyword Search (BM25)",
+        "what": (
+            "Searches for the question's exact words, weighting rare words more "
+            "than common ones. Complements the vector search, which compares meaning."
+        ),
+        "why": (
+            "Some answers live on an exact string - a unit number, an error code, a "
+            "named section. Embeddings blur near-identical words apart weakly; BM25 "
+            "matches them exactly."
+        ),
+    },
+    "rrf_fusion": {
+        "label": "Fusion (RRF)",
+        "what": (
+            "Merges the two rankings - meaning search and keyword search - into one, "
+            "using each chunk's POSITION in each list rather than its raw score. A "
+            "chunk high in either list scores well; a chunk high in both wins."
+        ),
+        "why": (
+            "Similarity (0..1) and BM25 (unbounded) are different scales. Adding their "
+            "scores would silently weight whichever happens to have bigger numbers. "
+            "Rank fusion never compares scales."
+        ),
+    },
     "candidate_retrieval": "Candidate Retrieval",
     "reranking": "Re-ranking",
     "context_building": "Context Building",
@@ -131,6 +156,23 @@ _STAGE_LABELS: dict[str, str] = {
     "web_search": "Web Search",
     "failsafe": "Offline Failsafe",
 }
+
+
+def _label_for(stage: str) -> str:
+    """Human label for a stage, whatever shape its registry entry has.
+
+    Most entries are a plain string. A few (the hybrid-retrieval stages) carry a
+    `what`/`why` pair so the UI can explain a stage it has never seen before
+    instead of hard-coding prose in two places. This function is the ONLY place
+    the registry is read for a label, so adding a richer entry cannot break any
+    of the existing call sites.
+    """
+    entry = _STAGE_LABELS.get(stage)
+    if isinstance(entry, dict):
+        return str(entry.get("label") or stage.replace("_", " ").title())
+    if entry:
+        return str(entry)
+    return stage.replace("_", " ").title()
 
 
 class TraceRecorder:
@@ -157,7 +199,7 @@ class TraceRecorder:
             status=status,
             duration_ms=int(duration_ms or 0),
             data=_sanitise(data or {}),
-            label=_STAGE_LABELS.get(stage, stage.replace("_", " ").title()),
+            label=_label_for(stage),
             created_at=dt.datetime.now(dt.timezone.utc),
         )
         self.events.append(event)
@@ -233,7 +275,12 @@ class TraceRecorder:
 # the alternative is a trace containing a stage the interface cannot label - which
 # is exactly the "something is missing and you cannot tell" failure this project
 # exists to prevent.
-CONDITIONAL_STAGES: tuple[str, ...] = ("web_search", "failsafe")
+CONDITIONAL_STAGES: tuple[str, ...] = (
+    "web_search",
+    "failsafe",
+    "bm25_search",
+    "rrf_fusion",
+)
 
 
 def stage_definitions() -> list[dict[str, str]]:
@@ -263,7 +310,7 @@ def stage_definitions() -> list[dict[str, str]]:
         "grounding",
     ]
     return [
-        {"stage": name, "label": _STAGE_LABELS.get(name, name.replace("_", " ").title())}
+        {"stage": name, "label": _label_for(name)}
         for name in order
     ]
 
@@ -273,7 +320,7 @@ def conditional_stage_definitions() -> list[dict[str, str]]:
     return [
         {
             "stage": name,
-            "label": _STAGE_LABELS.get(name, name.replace("_", " ").title()),
+            "label": _label_for(name),
             "conditional": "true",
         }
         for name in CONDITIONAL_STAGES

@@ -13,6 +13,7 @@ import {
   Paperclip,
   Settings2,
   Sparkles,
+  Square,
   Trash2,
   Wifi,
   WifiOff,
@@ -26,7 +27,6 @@ import { useAsync } from "@/hooks/useAsync";
 import { useWorkspaces } from "@/state/workspace";
 import { useToast } from "@/state/toast";
 import type {
-  AskResponse,
   Conversation,
   Grounding,
   ConversationScope,
@@ -127,6 +127,25 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     code: string;
     detail: Record<string, unknown>;
   } | null>(null);
+
+  /**
+   * Live streaming state for the answer being produced right now.
+   *
+   * `draft` is text the SERVER actually sent over the SSE stream - not a fake
+   * typewriter. `liveStage` is the label of the most recent REAL pipeline event
+   * the backend recorded. Both are transient: the canonical answer is committed
+   * to `messages` only when the `done` frame arrives, so a mid-stream failure
+   * discards the draft rather than leaving truncated text that looks complete.
+   */
+  const [draft, setDraft] = useState("");
+  const [liveStage, setLiveStage] = useState<string | null>(null);
+  const streamController = useRef<AbortController | null>(null);
+
+  /** Cancel the in-flight answer (the user started a new question or pressed stop). */
+  const stopStreaming = useCallback(() => {
+    streamController.current?.abort();
+    streamController.current = null;
+  }, []);
 
   /**
    * Whether the MOST RECENT run failed.
@@ -664,7 +683,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
     if (nearBottomRef.current) {
       element.scrollTop = element.scrollHeight;
     }
-  }, [messages.length, asking]);
+  }, [messages.length, asking, draft]);
 
   /* ---- guided repositioning for Learning Mode (one shot, never continuous)
      Entering Learning Mode - or picking a different answer - smoothly brings the
@@ -757,64 +776,107 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       // then reads from its beginning, and no manual scroll-up is needed.
       anchorQuestionRef.current = optimistic.id;
 
+      // A new question replaces any in-flight stream from the last one.
+      stopStreaming();
+      setDraft("");
+      setLiveStage(null);
+      const controller = new AbortController();
+      streamController.current = controller;
+
+      // The request body is identical to the buffered /chat/ask; only delivery
+      // changes. A pre-flight failure (an impossible page number, say) still
+      // throws an ApiError out of the awaited call, so the catch below behaves
+      // exactly as it did with the buffered version.
       try {
-        const result: AskResponse = await api.chat.ask({
-          question: trimmed,
-          workspace_id: activeId,
-          conversation_id: conversationId,
-          mode,
-          top_k: topK,
-          candidate_k: candidateK,
-          use_rerank: useRerank,
-          use_web_search: useWeb && mode === "online",
-          language: "en",
-        });
-
-        setMessages((current) => [
-          ...current.filter((message) => message.id !== optimistic.id),
-          { ...result.message, role: "user", content: trimmed } as Message,
-          result.message,
-        ]);
-
-        setGroundings((current) => ({ ...current, [result.message.id]: result.grounding }));
-        setTraces((current) => ({
-          ...current,
-          [result.message.id]: { ...result.trace, question: result.trace.question || trimmed },
-        }));
-
-        if (!conversationId) {
-          setConversationId(result.conversation_id);
-          // Stay inside whichever surface the user is on: asking from Learning Mode
-          // must not bounce them back to plain Chat.
-          navigate(
-            learning
-              ? `/app/learning/${result.conversation_id}`
-              : `/app/chat/${result.conversation_id}`,
-            { replace: true },
-          );
-        }
-
-        conversations.reload();
-
-        if (result.message.used_fallback) {
-          // Transient by design: the fact is also on the provider badge, which
-          // never disappears, so nothing is lost when this clears. The wording
-          // names the provider that actually answered rather than a hard-coded
-          // one - "so Groq answered instead" was wrong whenever Gemini fell back
-          // to something else.
-          // `provider_label` is already human-formatted by the backend
-          // (e.g. "Groq · Fallback"), so there is nothing to capitalise here.
-          const actual = result.provider_label || "the fallback provider";
-          toast.warning(
-            `Answered by ${actual}`,
-            "The primary provider was unavailable. This is labelled on the answer.",
-            2500,
-          );
-        }
+        await api.chat.askStream(
+          {
+            question: trimmed,
+            workspace_id: activeId,
+            conversation_id: conversationId,
+            mode,
+            top_k: topK,
+            candidate_k: candidateK,
+            use_rerank: useRerank,
+            use_web_search: useWeb && mode === "online",
+            language: "en",
+          },
+          {
+            // The user's turn is now persisted server-side; swap the optimistic
+            // row for its real id so per-message trace lookup survives a reload.
+            onReady: (info) => {
+              setMessages((current) =>
+                current.map((m) =>
+                  m.id === optimistic.id
+                    ? { ...m, id: info.user_message_id, conversation_id: info.conversation_id }
+                    : m,
+                ),
+              );
+              anchorQuestionRef.current = info.user_message_id;
+              if (!conversationId) {
+                setConversationId(info.conversation_id);
+                navigate(
+                  learning
+                    ? `/app/learning/${info.conversation_id}`
+                    : `/app/chat/${info.conversation_id}`,
+                  { replace: true },
+                );
+              }
+            },
+            // A real stage the backend just finished. We only track the label so
+            // the waiting line can name the ACTUAL current step instead of a
+            // timer-driven guess; skip/error stages do not advance it.
+            onStage: (event) => {
+              if (event.status === "skipped" || event.status === "error") return;
+              setLiveStage(event.label || event.stage);
+            },
+            // Append a real provider fragment, in order.
+            onToken: (text) => setDraft((current) => current + text),
+            // The answer is complete, cited and grounded. Commit the assistant
+            // message and discard the draft - the canonical message becomes the
+            // single source of truth. The user row was already swapped to its
+            // persisted id in `onReady` (ready is always the first frame), so this
+            // only appends the assistant turn; re-adding the user would duplicate it.
+            onDone: (result) => {
+              setDraft("");
+              setLiveStage(null);
+              setMessages((current) => [
+                ...current.filter((message) => message.id !== optimistic.id),
+                result.message,
+              ]);
+              setGroundings((current) => ({ ...current, [result.message.id]: result.grounding }));
+              setTraces((current) => ({
+                ...current,
+                [result.message.id]: { ...result.trace, question: result.trace.question || trimmed },
+              }));
+              conversations.reload();
+              if (result.message.used_fallback) {
+                const actual = result.provider_label || "the fallback provider";
+                toast.warning(
+                  `Answered by ${actual}`,
+                  "The primary provider was unavailable. This is labelled on the answer.",
+                  2500,
+                );
+              }
+            },
+            // A failure surfaced over the stream. `finally` discards the draft,
+            // so a truncated answer never persists in the transcript.
+            onError: (cause) => {
+              throw cause;
+            },
+          },
+          controller.signal,
+        );
       } catch (cause) {
+        setDraft("");
+        setLiveStage(null);
         // Roll the optimistic turn back so the transcript matches reality.
         setMessages((current) => current.filter((message) => message.id !== optimistic.id));
         setQuestion(trimmed);
+
+        // A deliberate stop (the user pressed Stop) is not a failure.
+        if (cause instanceof DOMException && cause.name === "AbortError") {
+          return;
+        }
 
         const message =
           cause instanceof ApiError ? cause.message : "The question could not be answered.";
@@ -848,6 +910,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
           toast.error("Could not answer that", message);
         }
       } finally {
+        streamController.current = null;
         setAsking(false);
       }
     },
@@ -863,6 +926,8 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       navigate,
       conversations,
       toast,
+      learning,
+      stopStreaming,
     ],
   );
 
@@ -1275,12 +1340,45 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 )}
 
                 {asking ? (
-                  /* The stage names only cycle in Learning Mode. On the normal Chat
-                     screen this is a plain waiting line. */
-                  <ThinkingStages
-                    offline={mode === "offline"}
-                    animate={learning}
-                  />
+                  draft ? (
+                    /* Text is arriving RIGHT NOW from the server. This is the real
+                       streamed answer, not a typewriter effect over a finished one.
+                       It stays visually distinct from a committed answer (an
+                       "answering" cursor and no action buttons), because it is a
+                       draft: until `done` fires it is not yet the canonical message
+                       and a mid-stream failure will discard it. */
+                    <div className="flex gap-3">
+                      <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-brand/12">
+                        <Sparkles className="h-3.5 w-3.5 text-brand" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="markdown-body break-words text-sm leading-relaxed text-ink">
+                          {draft}
+                          <span className="streaming-caret" aria-hidden />
+                        </div>
+                        <div className="mt-1.5 flex items-center gap-2 text-2xs text-faint">
+                          <button
+                            type="button"
+                            onClick={stopStreaming}
+                            className="inline-flex items-center gap-1 rounded-md border border-line px-1.5 py-0.5 font-medium text-muted transition hover:border-caution/50 hover:text-caution"
+                          >
+                            <Square className="h-2.5 w-2.5" /> Stop
+                          </button>
+                          {liveStage ? <span>{liveStage}</span> : null}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    /* Waiting: the pipeline is working but the first token has not
+                       arrived yet. In Learning Mode the real stage name (from the
+                       server's stage events) is shown as it happens; in plain Chat it
+                       is a calm waiting line. */
+                    <ThinkingStages
+                      offline={mode === "offline"}
+                      animate={learning}
+                      liveStage={liveStage}
+                    />
+                  )
                 ) : null}
 
                 {askError ? (

@@ -218,8 +218,21 @@ def check_grounding(
     citation_report: CitationReport,
     *,
     top_score: float = 0.0,
+    score_scale: str = "cosine",
 ) -> GroundingResult:
-    """Run every grounding check and produce a single honest verdict."""
+    """Run every grounding check and produce a single honest verdict.
+
+    `score_scale` names the scale `top_score` is on (cosine for dense, bm25 for
+    keyword-only, rrf for hybrid). The sufficiency text must label the number
+    with its REAL scale: under bm25 or hybrid the top score is not a cosine
+    similarity at all, and calling a BM25 value "cosine similarity" is the exact
+    mislabeled-scale failure the rest of the pipeline works to prevent.
+    """
+    scale_label = {
+        "cosine": "cosine similarity",
+        "bm25": "BM25 score",
+        "rrf": "reciprocal-rank score",
+    }.get((score_scale or "cosine").lower(), "score")
     result = GroundingResult(
         excerpt_count=len(excerpts),
         citation_count=count_citation_occurrences(answer),
@@ -239,7 +252,7 @@ def check_grounding(
     result.checks["retrieval_sufficiency"] = {
         "passed": sufficient,
         "detail": (
-            f"{len(excerpts)} excerpt(s) were retrieved; the best cosine similarity was "
+            f"{len(excerpts)} excerpt(s) were retrieved; the best {scale_label} was "
             f"{top_score:.3f}."
             if sufficient
             else "No excerpts were retrieved from this workspace."
