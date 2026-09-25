@@ -50,12 +50,19 @@ def deep_health() -> dict:
 
     adapter = get_llm_adapter()
     modes = adapter.mode_status()
-    providers = [status.as_dict() for status in adapter.provider_statuses()]
+    # The deep health payload is public (no auth) and user-facing. Engine identity
+    # is reported by ROLE only - cloud vendor names, model IDs and key-variable
+    # names are developer information and belong in server logs, not here.
+    from app.core.sanitize import public_engines
+
+    engines = public_engines()
+    online_available = engines["modes"]["online"]["available"]
+    offline_available = engines["modes"]["offline"]["available"]
 
     overall = "ok"
     if not database.get("ok") or not vector_store.get("ok"):
         overall = "degraded"
-    elif not modes["online"]["available"] and not modes["offline"]["available"]:
+    elif not online_available and not offline_available:
         overall = "degraded"
 
     return {
@@ -64,12 +71,17 @@ def deep_health() -> dict:
             "database": database,
             "vector_store": vector_store,
             "embeddings": embeddings,
-            "providers": providers,
-            "modes": modes,
+            "engines": engines["engines"],
+            "modes": engines["modes"],
         },
-        "secrets": {
-            "gemini_configured": settings.gemini_configured,
-            "groq_configured": settings.groq_configured,
-            "note": "Only whether a key is present is reported. Values are never exposed.",
+        "configuration": {
+            "remote_engine_configured": online_available,
+            "local_model_present": bool(
+                next(e for e in engines["engines"] if e["role"] == "offline")["configured"]
+            ),
+            "note": (
+                "Only whether the answer engines are configured is reported. "
+                "Credential values are never exposed."
+            ),
         },
     }

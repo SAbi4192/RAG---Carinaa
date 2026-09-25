@@ -15,6 +15,7 @@ import {
 
 import { cn } from "@/lib/cn";
 import { api } from "@/lib/api";
+import { engineShort } from "@/lib/engine";
 import { formatRelative } from "@/lib/format";
 import { useAsync } from "@/hooks/useAsync";
 import { useWorkspaces } from "@/state/workspace";
@@ -98,7 +99,7 @@ const STAGE_REFERENCE = [
     what: "Calls the model with the system instruction plus the numbered context.",
     why: "Separating instructions from data is what stops a document from issuing commands.",
     without: "No natural-language answer - only raw retrieved passages.",
-    observe: "The stage names the provider and model, and whether a fallback was used.",
+    observe: "The stage records the engine ROLE (primary, backup, local) and whether a fallback was used; cloud vendor identity is not exposed.",
   },
   {
     key: "citation_resolution",
@@ -289,8 +290,8 @@ export default function RagTrace() {
                           <span>{formatRelative(message.created_at)}</span>
                           <span aria-hidden>·</span>
                           <span className="font-mono">
-                            {message.provider || "unknown"}
-                            {message.used_fallback ? " (fallback)" : ""}
+                            {/* Role token, never a vendor (backend sanitizes provenance). */}
+                            {engineShort(message)}
                           </span>
                           {message.grounding_status ? (
                             <>

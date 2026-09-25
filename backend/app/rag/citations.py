@@ -127,10 +127,13 @@ class Citation:
         parts: list[str] = [self.document_name or f"Document {self.document_id}"]
 
         if self.page_number:
+            # Spec wording: "Page 22", not "p.22" - plain enough that a student
+            # skimming sources does not have to decode an abbreviation, and
+            # consistent between the card, the pill and the export pack.
             if self.page_end and self.page_end != self.page_number:
-                parts.append(f"p.{self.page_number}-{self.page_end}")
+                parts.append(f"Pages {self.page_number}-{self.page_end}")
             else:
-                parts.append(f"p.{self.page_number}")
+                parts.append(f"Page {self.page_number}")
         elif self.slide_number:
             parts.append(f"slide {self.slide_number}")
         elif self.sheet_name:

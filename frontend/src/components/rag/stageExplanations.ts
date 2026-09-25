@@ -137,8 +137,8 @@ export const STAGE_EXPLANATIONS: StageExplanation[] = [
     what: "The question plus the numbered context is sent to the language model.",
     why: "The model turns retrieved evidence into readable prose. It is the only stage that writes sentences, and the only one that can invent something.",
     without: "You would get the raw chunks back — accurate, but unreadable as an answer.",
-    where: "app/llm/ (Gemini, Groq, or the local GGUF)",
-    lookFor: "which provider actually answered. If Gemini failed and Groq answered, the label says 'Groq · Fallback' — it never claims the primary served it.",
+    where: "app/llm/ (remote engine chain, or the local GGUF)",
+    lookFor: "which ROLE answered: primary, fallback or local model. A fallback is always labelled 'Fallback' — it never claims the primary served it. Cloud vendor identity is deliberately not shown.",
   },
   {
     stage: "citation_resolution",

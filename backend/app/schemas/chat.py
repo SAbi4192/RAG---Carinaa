@@ -1,11 +1,23 @@
-"""Chat, RAG trace, and presentation-feature schemas."""
+"""Chat, RAG trace, and presentation-feature schemas.
+
+PUBLIC-DATA RULE
+----------------
+Every schema in this module is serialized to the browser. None of them may carry
+cloud-vendor identity (provider names, cloud model IDs, provider error strings).
+`MessageOut`, `VariantOut`, `ExplainOut` and `TextTranslateOut` enforce this at
+serialization time via `app.core.sanitize`, so a route that forgets to sanitize
+cannot leak - the database keeps the real provenance for developers, the wire
+never does.
+"""
 
 from __future__ import annotations
 
 import datetime as dt
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.sanitize import public_provenance, public_provider_label
 
 ShortenLevel = Literal["normal", "short", "very_short"]
 AiMode = Literal["online", "offline"]
@@ -63,6 +75,20 @@ class AskRequest(BaseModel):
 
     # Language for the generated answer (English by default)
     language: str = Field(default="en", max_length=8)
+
+    # Detailed Answer presentation style ("more_detail" | "mark8" | "mark16" |
+    # "mark20" | "university"). Retrieval is unchanged by it; validated against
+    # the server's own style list so a stale client cannot silently request an
+    # unknown shape. Empty means the ordinary depth-classified answer.
+    answer_style: str = ""
+
+    @field_validator("answer_style")
+    @classmethod
+    def _known_style_only(cls, value: str) -> str:
+        from app.rag.prompts import ANSWER_STYLES
+
+        normalized = (value or "").strip().lower()
+        return normalized if normalized in ANSWER_STYLES else ""
 
 
 class CitationOut(BaseModel):
@@ -129,6 +155,16 @@ class MessageOut(BaseModel):
     web_search_used: bool = False
     web_sources: list[Any] = Field(default_factory=list)
     created_at: dt.datetime
+
+    @model_validator(mode="after")
+    def _sanitize_provenance(self) -> "MessageOut":
+        # The stored row keeps the real provider; the wire never does. Local
+        # provenance keeps its (user-configured) model name. See app/core/sanitize.
+        if self.role == "assistant":
+            self.provider, self.model = public_provenance(self.provider, self.model)
+            if self.fallback_reason and self.provider != "local":
+                self.fallback_reason = "The primary answer engine was unavailable."
+        return self
 
 
 class AskResponse(BaseModel):
@@ -222,6 +258,11 @@ class TextTranslateOut(BaseModel):
     warning: str = ""
     original_unchanged: bool = True
 
+    @model_validator(mode="after")
+    def _sanitize_provenance(self) -> "TextTranslateOut":
+        self.provider, self.model = public_provenance(self.provider, self.model)
+        return self
+
 
 class ShortenRequest(BaseModel):
     message_id: int
@@ -242,9 +283,43 @@ class VariantOut(BaseModel):
     warning: str = ""
     original_unchanged: bool = True
 
+    @model_validator(mode="after")
+    def _sanitize_provenance(self) -> "VariantOut":
+        self.provider, self.model = public_provenance(self.provider, self.model)
+        return self
+
 
 class ExplainRequest(BaseModel):
     message_id: int
+
+
+class DetailedAnswerRequest(BaseModel):
+    """Re-present a stored answer in an exam-shaped format.
+
+    `style` is one of the ANSWER_STYLES keys; the server validates it and rejects
+    unknown values rather than answering with a default, because a silent fallback
+    would present the wrong format under the right label.
+    """
+
+    message_id: int
+    style: str = Field(min_length=2, max_length=20)
+
+    @field_validator("style")
+    @classmethod
+    def _known_style(cls, value: str) -> str:
+        from app.rag.prompts import ANSWER_STYLES
+
+        normalized = (value or "").strip().lower()
+        if normalized not in ANSWER_STYLES:
+            raise ValueError(
+                f"'{value}' is not a detailed answer style. "
+                f"Choose one of: {', '.join(sorted(ANSWER_STYLES))}."
+            )
+        return normalized
+
+
+class AnswerStylesOut(BaseModel):
+    styles: list[dict[str, str]]
 
 
 class ExplainOut(BaseModel):
@@ -254,6 +329,11 @@ class ExplainOut(BaseModel):
     model: str = ""
     used_fallback: bool = False
     cached: bool = False
+
+    @model_validator(mode="after")
+    def _sanitize_provenance(self) -> "ExplainOut":
+        self.provider, self.model = public_provenance(self.provider, self.model)
+        return self
 
 
 class SpeechRequest(BaseModel):

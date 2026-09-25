@@ -257,6 +257,7 @@ class Retriever:
         candidate_k: int | None = None,
         document_ids: Sequence[int] | None = None,
         page_number: int | None = None,
+        page_span: tuple[int, int] | None = None,
         section: str | None = None,
         use_rerank: bool | None = None,
         trace: TraceRecorder | None = None,
@@ -335,23 +336,39 @@ class Retriever:
         candidates: list[RetrievedChunk] = []
 
         if mode in ("dense", "hybrid"):
+            # Began BEFORE the network call so the live pipeline can mark the
+            # stage running while the search is still in flight; `add()` below
+            # closes the same event instead of appending a second one.
+            search_event = trace.begin("vector_search") if trace else None
             try:
-                candidates = self.store.query(
-                    workspace_id=workspace_id,
-                    query_embedding=query_vector,
-                    top_k=candidate_k,
-                    document_ids=document_ids,
-                    page_number=page_number,
-                    section=section,
-                )
+                try:
+                    candidates = self.store.query(
+                        workspace_id=workspace_id,
+                        query_embedding=query_vector,
+                        top_k=candidate_k,
+                        document_ids=document_ids,
+                        page_number=page_number,
+                        page_span=page_span,
+                        section=section,
+                    )
+                except RetrievalError:
+                    raise
+                except Exception as exc:
+                    logger.exception("Retrieval failed for workspace %s", workspace_id)
+                    raise RetrievalError(
+                        "The vector search could not be completed.",
+                        detail={"reason": exc.__class__.__name__},
+                    ) from exc
             except RetrievalError:
+                # The live step must not stay "running" after a failed search;
+                # close it as an error before the exception reaches the caller.
+                if trace and search_event is not None:
+                    trace.add(
+                        "vector_search",
+                        status="error",
+                        duration_ms=int((time.perf_counter() - search_start) * 1000),
+                    )
                 raise
-            except Exception as exc:
-                logger.exception("Retrieval failed for workspace %s", workspace_id)
-                raise RetrievalError(
-                    "The vector search could not be completed.",
-                    detail={"reason": exc.__class__.__name__},
-                ) from exc
             outcome.search_ms = int((time.perf_counter() - search_start) * 1000)
 
             if trace:
@@ -366,6 +383,7 @@ class Retriever:
                         "distance_metric": "cosine",
                         "document_filter": list(document_ids) if document_ids else None,
                         "page_filter": page_number,
+                        "page_span_filter": list(page_span) if page_span else None,
                         "section_filter": section,
                         "workspace_filter_applied": True,
                     },
@@ -388,6 +406,7 @@ class Retriever:
                 candidate_k=candidate_k,
                 document_ids=document_ids,
                 page_number=page_number,
+                page_span=page_span,
                 section=section,
                 trace=trace,
             )
@@ -469,6 +488,10 @@ class Retriever:
         # Stage 5 - optional re-ranking
         # ---------------------------------------------------------------
         if rerank_enabled and candidates:
+            # Live begin: re-ranking loads a model and can take a visible second;
+            # the UI marks the stage running while it happens.
+            if trace:
+                trace.begin("reranking")
             reranker = get_reranker()
             result = reranker.rerank(
                 outcome.analysis.normalized, candidates, top_n=top_k
@@ -530,6 +553,7 @@ class Retriever:
         candidate_k: int,
         document_ids: Sequence[int] | None,
         page_number: int | None,
+        page_span: tuple[int, int] | None,
         section: str | None,
         trace: TraceRecorder | None,
     ) -> tuple[list[RetrievedChunk], dict[str, Any], int]:
@@ -560,6 +584,7 @@ class Retriever:
             workspace_id,
             document_ids=document_ids,
             page_number=page_number,
+            page_span=page_span,
             section=section,
         )
         index = Bm25Index.build(corpus, k1=settings.bm25_k1, b=settings.bm25_b)

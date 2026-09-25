@@ -27,6 +27,7 @@ import {
 
 import { cn } from "@/lib/cn";
 import { ApiError, api } from "@/lib/api";
+import { engineLabel } from "@/lib/engine";
 import { Spinner } from "@/components/ui/Feedback";
 import { formatDuration } from "@/lib/format";
 import type { TraceStage } from "@/lib/types";
@@ -139,13 +140,17 @@ const SIMPLE_STEPS: SimpleStep[] = [
 ];
 
 /**
- * Find a provider-failure-and-recovery pair.
+ * Find an engine-failure-and-recovery pair, described by ROLE.
  *
- * When the primary provider fails and the fallback answers, the trace contains two
- * `llm_generation` events: one with status=error and role=primary, then one with
- * status=ok and role=fallback. That is genuinely useful to a learner - it is a real
- * distributed-systems behaviour, happening live - so instead of a red "Error" it
- * becomes a short lesson in how fallbacks work.
+ * When the primary answer engine fails and the backup answers, the trace contains
+ * two `llm_generation` events: one with status=error and role=primary, then one
+ * with status=ok and role=fallback. That is genuinely useful to a learner - it is
+ * a real distributed-systems behaviour, happening live - so instead of a red
+ * "Error" it becomes a short lesson in how fallbacks work.
+ *
+ * The events are sanitized upstream (app/core/sanitize.py): `provider` arrives as
+ * the generic role token "remote"/"local", never a vendor. The wording here is
+ * role-based to match, so even the narrative never implies a specific company.
  */
 function findFallback(stages: TraceStage[]) {
   const failed = stages.find(
@@ -157,10 +162,10 @@ function findFallback(stages: TraceStage[]) {
   );
   if (!recovered) return null;
   return {
-    primary: String(failed.data?.provider ?? "the primary provider"),
+    primary: "Primary answer engine",
     reason: String(failed.data?.error ?? "unavailable"),
-    fallback: String(recovered.data?.provider ?? "the fallback provider"),
-    model: recovered.data?.model ? String(recovered.data.model) : null,
+    fallback: "Backup answer engine",
+    model: null as string | null,
   };
 }
 
@@ -186,6 +191,7 @@ export function LearningPanel({
   stages,
   totalMs,
   running,
+  live = false,
   onClose,
   onPlayingChange,
   failed = false,
@@ -200,6 +206,16 @@ export function LearningPanel({
   stages: TraceStage[];
   totalMs?: number;
   running?: boolean;
+  /**
+   * The `stages` list is a LIVE broadcast from the backend, not a finished run.
+   *
+   * When true, the panel switches from replay to real observation: events with
+   * status "running" show the step as genuinely active, terminal events mark it
+   * done/failed/skipped, and unseen steps stay pending. No timer-driven fake
+   * progress - if the backend has not emitted a stage, the panel does not claim
+   * it is happening.
+   */
+  live?: boolean;
   onClose?: () => void;
   /**
    * Reports whether the walkthrough is still playing. Chat holds a hard timeout
@@ -262,6 +278,13 @@ export function LearningPanel({
       setPlaying(false);
       return;
     }
+    // LIVE observation is not a replay: every real event that has arrived is
+    // shown, and its status (running/ok/error/skipped) drives the step directly.
+    if (live) {
+      setRevealed(stages.length);
+      setPlaying(false);
+      return;
+    }
     if (prefersReducedMotion) {
       setRevealed(stages.length);
       setPlaying(false);
@@ -271,7 +294,7 @@ export function LearningPanel({
     setRevealed(0);
     setPlaying(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the run signature
-  }, [signature, prefersReducedMotion]);
+  }, [signature, prefersReducedMotion, live]);
 
   // A failed run must not animate to completion.
   useEffect(() => {
@@ -291,10 +314,14 @@ export function LearningPanel({
       return;
     }
     const stage = stages[revealed];
-    // Real duration drives the pace, clamped: a slow stage reads as slower than a
-    // fast one, without a 23 s generation freezing the walkthrough.
+    // Real duration drives the pace, clamped - AND the whole replay is held to a
+    // 2-second budget. The walkthrough is a presentation layer: a long trace must
+    // not turn it into a long wait, so the per-step delay is also capped by
+    // (2000 / number of steps). A short run still paces naturally; a 40-event run
+    // finishes the animation inside 2 s.
     const raw = stage?.duration_ms ?? 0;
-    const delay = Math.min(620, Math.max(150, raw * 0.35));
+    const budget = Math.max(60, Math.floor(2000 / Math.max(1, stages.length)));
+    const delay = Math.min(budget, Math.max(90, raw * 0.35));
     const timer = window.setTimeout(() => setRevealed((value) => value + 1), delay);
     return () => window.clearTimeout(timer);
   }, [playing, revealed, stages]);
@@ -460,6 +487,12 @@ export function LearningPanel({
       const hasOk = mine.some((entry) =>
         entry.items.some((item) => item.stage.status === "ok"),
       );
+      // A live event that is still in flight overrides every replay computation:
+      // the step is ACTIVE because the BACKEND said it started, not because a
+      // timer reached it.
+      const isRunning = mine.some((entry) =>
+        entry.items.some((item) => item.stage.status === "running"),
+      );
       const allSkipped =
         mine.length > 0 &&
         mine.every((entry) =>
@@ -467,9 +500,16 @@ export function LearningPanel({
         );
 
       let status: StepStatus;
-      if (mine.length === 0 || allSkipped) {
+      if (live && mine.length === 0) {
+        // In a live run, a stage with no event yet has NOT happened. Marking it
+        // "skipped" would claim the backend chose not to run it, which is a
+        // different statement from "it has not got there yet".
+        status = "pending";
+      } else if (mine.length === 0 || allSkipped) {
         // e.g. a step the question never needed (web search off, no re-ranking).
         status = "skipped";
+      } else if (isRunning) {
+        status = "active";
       } else if (hasError && !hasOk) {
         status = "failed";
       } else if (allRevealed || replayDone) {
@@ -486,7 +526,7 @@ export function LearningPanel({
 
       return { ...step, mine, status, durationMs };
     });
-  }, [stages, revealed, playing]);
+  }, [stages, revealed, playing, live]);
 
   /* ---- translate this explanation (opt-in, compact) ------------------------
      Translation is a choice, not a block that is always on screen. The control
@@ -1154,23 +1194,16 @@ export function LearningPanel({
                 {providerInfo ? (
                   <dl className="space-y-1 text-2xs">
                     <div className="flex gap-2">
-                      <dt className="shrink-0 text-faint">LLM provider</dt>
+                      <dt className="shrink-0 text-faint">Answer engine</dt>
                       <dd className="min-w-0 flex-1 font-medium text-ink">
-                        {providerInfo.provider
-                          ? providerInfo.provider.charAt(0).toUpperCase() +
-                            providerInfo.provider.slice(1)
-                          : "—"}
-                        {providerInfo.usedFallback ? " (fallback)" : ""}
+                        {engineLabel({
+                          provider: providerInfo.provider,
+                          model: providerInfo.model,
+                          used_fallback: providerInfo.usedFallback,
+                        })}
+                        {providerInfo.role === "fallback" ? " (backup)" : ""}
                       </dd>
                     </div>
-                    {providerInfo.model ? (
-                      <div className="flex gap-2">
-                        <dt className="shrink-0 text-faint">Model</dt>
-                        <dd className="min-w-0 flex-1 font-mono text-ink">
-                          {providerInfo.model}
-                        </dd>
-                      </div>
-                    ) : null}
                     {providerInfo.reason ? (
                       <div className="flex gap-2">
                         <dt className="shrink-0 text-faint">Fallback reason</dt>

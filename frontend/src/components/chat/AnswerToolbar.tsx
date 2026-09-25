@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  BookOpenText,
   Check,
   ChevronDown,
   Copy,
@@ -50,6 +51,20 @@ const SHORTEN_LABELS: Record<string, string> = {
   very_short: "Very short",
 };
 
+/**
+ * The Detailed Answer menu, mirroring the server's ANSWER_STYLES (see
+ * backend/app/rag/prompts.py). Labels match the capability payload's canonical
+ * style names; if this ever drifts the server's validator rejects the request,
+ * which is the correct failure direction - never a silent wrong format.
+ */
+const DETAILED_STYLES = [
+  { value: "more_detail", label: "More Detail", hint: "Expand the answer moderately" },
+  { value: "mark8", label: "8-Mark Answer", hint: "Short exam-style structured answer" },
+  { value: "mark16", label: "16-Mark Answer", hint: "Substantial university-style answer" },
+  { value: "mark20", label: "20-Mark Answer", hint: "Comprehensive long answer" },
+  { value: "university", label: "University Style", hint: "General structured long answer" },
+] as const;
+
 export interface AnswerToolbarProps {
   message: Message;
   /** The text currently displayed (original or variant). */
@@ -74,8 +89,10 @@ export function AnswerToolbar({
   const toast = useToast();
 
   const [copied, setCopied] = useState(false);
-  const [busy, setBusy] = useState<"" | "translate" | "shorten" | "explain">("");
-  const [openMenu, setOpenMenu] = useState<"" | "translate" | "shorten" | "export">("");
+  const [busy, setBusy] = useState<"" | "translate" | "shorten" | "explain" | "detailed">("");
+  const [openMenu, setOpenMenu] = useState<
+    "" | "translate" | "shorten" | "detailed" | "export"
+  >("");
   /** Separate from `busy`: an export is a download, not a mutation of the answer,
    *  so it must not grey out Translate/Shorten/Explain while it runs. */
   const [exporting, setExporting] = useState<"" | "md" | "html">("");
@@ -223,6 +240,47 @@ export function AnswerToolbar({
     [message.id, onVariantChange, toast],
   );
 
+  /* ---- detailed answer (exam-style re-presentation) ------------------- */
+  const handleDetailed = useCallback(
+    async (style: string) => {
+      setOpenMenu("");
+      setBusy("detailed");
+      try {
+        const variant = await api.features.detailed(message.id, style);
+        onVariantChange(variant);
+        const label =
+          DETAILED_STYLES.find((entry) => entry.value === style)?.label ?? style;
+        if (variant.warning) {
+          toast.warning("Detailed answer needs a look", variant.warning);
+        } else {
+          toast.success(
+            `Detailed answer: ${label}`,
+            variant.cached
+              ? "Loaded from cache."
+              : "Built from the same evidence, with the same citations.",
+          );
+        }
+      } catch (cause) {
+        // 422 = the longer version cited something the evidence does not contain.
+        // That is a refusal, not a failure - say why, and keep the original visible.
+        if (cause instanceof ApiError && cause.code === "detailed_answer_rejected") {
+          toast.warning(
+            "Detailed answer rejected - original kept",
+            cause.message,
+          );
+        } else {
+          toast.error(
+            "Could not generate the detailed answer",
+            cause instanceof ApiError ? cause.message : "Please try again.",
+          );
+        }
+      } finally {
+        setBusy("");
+      }
+    },
+    [message.id, onVariantChange, toast],
+  );
+
   /* ---- read aloud ---------------------------------------------------- */
   const handleSpeak = useCallback(async () => {
     if (speaking) {
@@ -309,7 +367,9 @@ export function AnswerToolbar({
                 ? `Translated · ${activeVariant.language.toUpperCase()}`
                 : activeVariant.kind === "shortened"
                   ? `Condensed · ${SHORTEN_LABELS[activeVariant.level] ?? activeVariant.level}`
-                  : "Variant"}
+                  : activeVariant.kind === "detailed"
+                    ? `Detailed · ${DETAILED_STYLES.find((s) => s.value === activeVariant.level)?.label ?? activeVariant.level}`
+                    : "Variant"}
             </Badge>
             <span className="text-2xs text-muted">
               The original answer is preserved and unchanged.
@@ -406,6 +466,43 @@ export function AnswerToolbar({
               <p className="border-t border-line px-2 pb-1 pt-1.5 text-2xs leading-relaxed text-faint">
                 This compresses the answer - it does not rewrite it. If concepts, numbers or
                 citations would be lost, the shortening is rejected and the original kept.
+              </p>
+            </div>
+          ) : null}
+        </div>
+
+        {/* detailed answer - exam-style re-presentation from the same evidence */}
+        <div className="relative">
+          <ToolbarButton
+            icon={busy === "detailed" ? <Spinner size={14} /> : <BookOpenText className="h-3.5 w-3.5" />}
+            label="Detailed Answer"
+            trailing={<ChevronDown className="h-3 w-3" />}
+            active={openMenu === "detailed"}
+            disabled={busy !== ""}
+            title="Re-present this answer in an exam style, from the same evidence"
+            onClick={() => setOpenMenu(openMenu === "detailed" ? "" : "detailed")}
+          />
+
+          {openMenu === "detailed" ? (
+            <div className="absolute bottom-full left-0 z-30 mb-1.5 w-72 animate-slide-down rounded-lg border border-line bg-raised p-1 shadow-pop">
+              <p className="px-2 py-1.5 text-2xs font-semibold uppercase tracking-wide text-faint">
+                Detailed answer
+              </p>
+              {DETAILED_STYLES.map((style) => (
+                <button
+                  key={style.value}
+                  type="button"
+                  onClick={() => void handleDetailed(style.value)}
+                  className="w-full rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-sunken"
+                >
+                  <span className="block text-xs text-ink">{style.label}</span>
+                  <span className="block text-2xs text-faint">{style.hint}</span>
+                </button>
+              ))}
+              <p className="border-t border-line px-2 pb-1 pt-1.5 text-2xs leading-relaxed text-faint">
+                Uses the same retrieved evidence and citations as the original. A
+                version that cites anything outside that evidence is rejected and
+                the original is kept.
               </p>
             </div>
           ) : null}

@@ -27,6 +27,7 @@ import { useAsync } from "@/hooks/useAsync";
 import { useWorkspaces } from "@/state/workspace";
 import { useToast } from "@/state/toast";
 import type {
+  AskStreamStage,
   Conversation,
   Grounding,
   ConversationScope,
@@ -139,7 +140,26 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
    */
   const [draft, setDraft] = useState("");
   const [liveStage, setLiveStage] = useState<string | null>(null);
+  /**
+   * Live pipeline events for the run in flight, keyed by the backend's `seq`.
+   *
+   * The server now broadcasts every stage TWICE under the same seq - once as it
+   * starts (`running`) and once when it finishes - so the panel can show the real
+   * active step instead of a replayed one. Map-over-seq means an update replaces
+   * the step it belongs to instead of appending a duplicate.
+   */
+  const [liveStages, setLiveStages] = useState<Record<number, AskStreamStage>>({});
   const streamController = useRef<AbortController | null>(null);
+  /**
+   * Composer textarea + a synchronous in-flight guard.
+   *
+   * `asking` is React state, and two Enter presses inside one frame both read the
+   * stale `false` value before the re-render lands - the classic double-submit.
+   * This ref flips immediately, so the second press is refused no matter how fast
+   * it follows the first.
+   */
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const askingRef = useRef(false);
 
   /** Cancel the in-flight answer (the user started a new question or pressed stop). */
   const stopStreaming = useCallback(() => {
@@ -246,6 +266,19 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
    */
   const latestTrace = inspectedMessageId ? traces[inspectedMessageId] ?? null : null;
 
+  /**
+   * The run currently in flight, as real events.
+   *
+   * The backend broadcasts every pipeline stage as it STARTS (status "running")
+   * and again when it finishes, keyed by a stable `seq`. This map turns that back
+   * into an ordered stage list for the Learning panel, so a live run shows what
+   * the backend is ACTUALLY doing rather than a timer-driven replay.
+   */
+  const liveStageList = useMemo<AskStreamStage[]>(
+    () => Object.values(liveStages).sort((a, b) => a.seq - b.seq),
+    [liveStages],
+  );
+
   // Learning Mode needs the trace even for a conversation loaded from history,
   // where no ask response is in memory. Fetched once, on demand - including for
   // whichever older answer the user clicks.
@@ -348,11 +381,31 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       setRevealDeadlinePassed(false);
       return;
     }
-    const timer = window.setTimeout(() => setRevealDeadlinePassed(true), 7000);
+    // The pipeline visualization must NEVER delay the answer by more than two
+    // seconds. If the backend finishes sooner, the run ends naturally; if it
+    // takes longer, the animation stops counting as a reason to hold the answer
+    // and the transcript reveals it while the panel keeps showing real status.
+    const timer = window.setTimeout(() => setRevealDeadlinePassed(true), 2000);
     return () => window.clearTimeout(timer);
   }, [pipelinePlaying]);
 
   const holdNewestAnswer = learning && pipelinePlaying && !revealDeadlinePassed;
+
+  /**
+   * Composer auto-grow, driven by content rather than a fixed row count.
+   *
+   * The height resets to the CSS minimum, then grows to exactly what the text
+   * needs up to 168px; past that cap the textarea scrolls internally, so a
+   * five-paragraph question can never push the composer across the screen or
+   * jump the layout. Measuring `scrollHeight` (not guessing line counts) is what
+   * keeps wrapping, window resizes and IME input in one mechanism.
+   */
+  useEffect(() => {
+    const node = composerRef.current;
+    if (!node) return;
+    node.style.height = "";
+    node.style.height = `${Math.min(node.scrollHeight, 168)}px`;
+  }, [question]);
 
   /**
    * Uploading from chat.
@@ -737,12 +790,21 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
   const ask = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || !activeId || asking) return;
+      // `askingRef`, not `asking`: React state has not re-rendered yet when a
+      // second Enter arrives in the same frame, so a state check alone lets a
+      // rapid double press through twice.
+      if (!trimmed || !activeId || askingRef.current) return;
 
+      askingRef.current = true;
       setAsking(true);
       setAskError(null);
       setRunFailed(false);
       setQuestion("");
+      // Clearing the text does not clear a grown textarea on its own; the height
+      // is driven by content, so reset it when the composer empties.
+      if (composerRef.current) {
+        composerRef.current.style.height = "";
+      }
       // A fresh question means the panel should explain the NEW run, not whatever
       // older answer was previously selected.
       setSelectedMessageId(null);
@@ -780,6 +842,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       stopStreaming();
       setDraft("");
       setLiveStage(null);
+      setLiveStages({});
       const controller = new AbortController();
       streamController.current = controller;
 
@@ -822,10 +885,15 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                 );
               }
             },
-            // A real stage the backend just finished. We only track the label so
-            // the waiting line can name the ACTUAL current step instead of a
-            // timer-driven guess; skip/error stages do not advance it.
+            // A real stage event from the backend. The server broadcasts each
+            // stage twice under the same `seq`: once as it STARTS (status
+            // "running") and once when it finishes. Keying the live map by `seq`
+            // means the second broadcast updates the step instead of appending a
+            // duplicate, so the panel shows the genuinely active stage. The label
+            // of the most recent real event also names the current step in the
+            // waiting line - never a timer-driven guess.
             onStage: (event) => {
+              setLiveStages((current) => ({ ...current, [event.seq]: event }));
               if (event.status === "skipped" || event.status === "error") return;
               setLiveStage(event.label || event.stage);
             },
@@ -839,6 +907,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
             onDone: (result) => {
               setDraft("");
               setLiveStage(null);
+              // The live map is replaced by the final trace for the committed
+              // message; keeping it after done would leave the panel showing a
+              // run that no longer matches anything.
+              setLiveStages({});
               setMessages((current) => [
                 ...current.filter((message) => message.id !== optimistic.id),
                 result.message,
@@ -850,10 +922,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
               }));
               conversations.reload();
               if (result.message.used_fallback) {
-                const actual = result.provider_label || "the fallback provider";
+                const actual = result.provider_label || "the backup answer engine";
                 toast.warning(
                   `Answered by ${actual}`,
-                  "The primary provider was unavailable. This is labelled on the answer.",
+                  "The primary answer engine was unavailable. This is labelled on the answer.",
                   2500,
                 );
               }
@@ -869,6 +941,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
       } catch (cause) {
         setDraft("");
         setLiveStage(null);
+        setLiveStages({});
         // Roll the optimistic turn back so the transcript matches reality.
         setMessages((current) => current.filter((message) => message.id !== optimistic.id));
         setQuestion(trimmed);
@@ -911,12 +984,12 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
         }
       } finally {
         streamController.current = null;
+        askingRef.current = false;
         setAsking(false);
       }
     },
     [
       activeId,
-      asking,
       conversationId,
       mode,
       topK,
@@ -1167,7 +1240,7 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                     value: "online",
                     label: "Online",
                     icon: <Wifi className="h-3 w-3" />,
-                    title: "Groq first, Gemini as a disclosed fallback",
+                    title: "Remote answer engine first, with a disclosed fallback",
                   },
                   {
                     value: "offline",
@@ -1303,8 +1376,11 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                         className="flex items-center gap-3 rounded-2xl border border-brand/25 bg-brand/6 px-4 py-3.5"
                       >
                         <Spinner size={14} />
+                        {/* The pipeline beside the chat explains this wait, so the
+                            line only names the ACTUAL stage the backend is on (from
+                            its live events) instead of a generic "building" message. */}
                         <span className="text-xs text-muted">
-                          Building the answer — watch the pipeline on the right.
+                          {liveStage ?? "Working on your answer"}…
                         </span>
                       </div>
                     ) : (
@@ -1539,10 +1615,14 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
 
                   <div className="relative min-w-0 flex-1">
                     <Textarea
+                      ref={composerRef}
                       value={question}
                       onChange={(event) => setQuestion(event.target.value)}
                       onKeyDown={(event) => {
-                        if (event.key === "Enter" && !event.shiftKey) {
+                        // Enter sends; Shift+Enter inserts a newline (standard chat
+                        // convention). `isComposing` guards against the Enter that
+                        // ends an IME candidate selection sending by accident.
+                        if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                           event.preventDefault();
                           void ask(question);
                         }
@@ -1555,7 +1635,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
                       rows={1}
                       disabled={!active?.stats?.documents}
                       aria-label="Ask Carinaa"
-                      className="min-h-[2.25rem] resize-none border-0 bg-transparent px-1.5 py-1.5 shadow-none focus:border-0 focus:ring-0"
+                      /* Auto-grow: the inline height is driven by content (see the
+                         effect), capped at 168px so the composer can never cover
+                         the screen; past the cap the text scrolls internally. */
+                      className="max-h-[168px] min-h-[2.25rem] resize-none overflow-y-auto border-0 bg-transparent px-1.5 py-1.5 shadow-none transition-[height] duration-150 focus:border-0 focus:ring-0"
                     />
                   </div>
 
@@ -1603,9 +1686,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
           {learning && pipelineMode === "side" ? (
             <aside className="hidden w-[40%] max-w-[520px] shrink-0 border-l border-line lg:block">
               <LearningPanel
-                stages={latestTrace?.stages ?? []}
-                totalMs={latestTrace?.total_ms}
+                stages={asking ? liveStageList : (latestTrace?.stages ?? [])}
+                totalMs={asking ? undefined : latestTrace?.total_ms}
                 running={asking}
+                live={asking}
                 onClose={() => setPipelineMode("hidden")}
                 onPlayingChange={setPipelinePlaying}
                 failed={runFailed}
@@ -1639,9 +1723,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
               </div>
               <div className="min-h-0 flex-1">
                 <LearningPanel
-                  stages={latestTrace?.stages ?? []}
-                  totalMs={latestTrace?.total_ms}
+                  stages={asking ? liveStageList : (latestTrace?.stages ?? [])}
+                  totalMs={asking ? undefined : latestTrace?.total_ms}
                   running={asking}
+                  live={asking}
                   onClose={() => setPipelineMode("side")}
                   onPlayingChange={setPipelinePlaying}
                   failed={runFailed}
@@ -1720,9 +1805,10 @@ export default function Chat({ learning = false }: { learning?: boolean }) {
           />
           <div className="absolute inset-y-0 right-0 flex w-full max-w-[420px] animate-fade-in flex-col border-l border-line bg-surface shadow-pop">
             <LearningPanel
-              stages={latestTrace?.stages ?? []}
-              totalMs={latestTrace?.total_ms}
+              stages={asking ? liveStageList : (latestTrace?.stages ?? [])}
+              totalMs={asking ? undefined : latestTrace?.total_ms}
               running={asking}
+              live={asking}
               onClose={() => setShowPipelineDrawer(false)}
               question={inspectedQuestion}
               selectedMessageId={inspectedMessageId}

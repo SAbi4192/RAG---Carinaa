@@ -140,7 +140,11 @@ def test_export_markdown_contains_the_stored_evidence(client, make_user) -> None
     # present - assembled from the row, not regenerated.
     assert "What is a hypervisor?" in body
     assert "A hypervisor abstracts hardware [1]." in body
-    assert "groq" in body
+    # The exported pack is a user-facing artifact: engine identity is a ROLE, never
+    # a cloud vendor (the seed row was produced with provider="groq").
+    assert "Remote answer engine" in body
+    assert "groq" not in body.lower()
+    assert "openai/" not in body.lower()
     assert "virtualization.md" in body
     assert "Virtualization" in body
     assert "vector_search" not in body or "Vector Search" in body  # label is used

@@ -126,7 +126,7 @@ export function AskControls({
         <div className="inline-flex rounded-lg border border-line bg-sunken p-0.5">
           {(
             [
-              { value: "online", label: "Online", icon: Cloud, hint: "Groq first, Gemini fallback" },
+              { value: "online", label: "Online", icon: Cloud, hint: "remote answer engine, with a disclosed fallback" },
               { value: "offline", label: "Offline", icon: HardDrive, hint: "local GGUF model" },
             ] as const
           ).map((option) => {
@@ -160,8 +160,9 @@ export function AskControls({
 
       {mode === "offline" ? (
         <p className="text-2xs leading-relaxed text-faint">
-          Offline runs Qwen2.5-3B on the CPU. It is slower and less capable than the online
-          providers, and it never contacts the network — not even as a fallback.
+          Offline runs the configured local GGUF model on the CPU. It is slower and less
+          capable than the remote engines, and it never contacts the network — not even as
+          a fallback.
         </p>
       ) : null}
     </div>

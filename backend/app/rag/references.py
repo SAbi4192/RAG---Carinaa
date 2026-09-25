@@ -97,12 +97,14 @@ def needs_document_clarification(
     """Whether a page question is ambiguous across several documents.
 
     Returns the candidate filenames when the user must choose, or None when the
-    question is answerable as asked.
+    question is answerable as asked. `page_number` may be a single page OR the
+    first page of a range - both are page references, and a range ("pages 20-22")
+    has exactly the same ambiguity problem as one page: it names a location without
+    naming a document, and picking one of several PDFs would be inventing an answer.
 
     Only a PAGE reference triggers this. "Summarize this document" with two documents
     in scope is a different situation - it is reasonable to summarise both, whereas
-    "page 2" has no meaning across two documents and picking one would be inventing
-    an answer.
+    "page 2" has no meaning across two documents.
     """
     if page_number is None:
         return None

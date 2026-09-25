@@ -218,6 +218,28 @@ class WebSearchDisabled(CarinaaError):
     message = "Web search is disabled for this request."
 
 
+class DetailedAnswerError(CarinaaError):
+    """A Detailed Answer could not be generated (engine down, no evidence)."""
+
+    status_code = status.HTTP_502_BAD_GATEWAY
+    code = "detailed_answer_error"
+    message = (
+        "The detailed version could not be generated. The original answer is "
+        "unchanged."
+    )
+
+
+class DetailedAnswerRejected(CarinaaError):
+    """The detailed version failed citation validation; nothing was stored."""
+
+    status_code = 422  # Unprocessable Content
+    code = "detailed_answer_rejected"
+    message = (
+        "The detailed version cited sources that are not in this answer's evidence, "
+        "so it was rejected. The original answer is unchanged."
+    )
+
+
 # --------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import { ChevronDown, Database, Gauge, Globe, BookOpen, Microscope, Sparkles, Us
 import { cn } from "@/lib/cn";
 import { formatDuration, formatScore, formatTimeOfDay, scoreTone } from "@/lib/format";
 import type { Citation, Grounding, Language, Message, Variant } from "@/lib/types";
+import { engineLabel } from "@/lib/engine";
 import { Badge } from "@/components/ui/Badge";
 import { Markdown } from "@/components/chat/Markdown";
 import { AnswerToolbar } from "@/components/chat/AnswerToolbar";
@@ -17,7 +18,8 @@ import { RefusalPanel } from "@/components/chat/RefusalPanel";
  * The assistant bubble carries more than the answer, and each extra piece is
  * there for a reason:
  *
- *   PROVIDER      which model actually answered. A Groq fallback is labelled as a
+ *   PROVIDER      which class of engine actually answered, as a role - remote or
+ *                 local. A fallback is labelled as a
  *                 fallback - never disguised as the primary. That is a hard rule.
  *   GROUNDING     how well the evidence supports the answer.
  *   LATENCY       how long it really took, including the slow local model.
@@ -536,25 +538,17 @@ export function MessageBubble({
  * Provider label.
  *
  * The single most important honesty rule in the UI: if the answer came from the
- * fallback, it says so. There is no configuration in which a Groq response is
- * displayed as "Gemini".
+ * fallback, it says so - there is no configuration in which a fallback response
+ * is displayed as the primary one. The second rule: it says so in ROLES. The
+ * backend sanitises provenance to "remote" / "local" (see app/core/sanitize.py),
+ * so even the raw field this component reads has never contained a vendor name.
+ * The user sees "Remote answer engine", "Local · <their model>", "Fallback".
  */
 function ProviderBadge({ message }: { message: Message }) {
-  const isLocal = message.provider === "local";
   const isFallback = message.used_fallback;
-  // Same derivation as in the bubble: `is_extractive_failsafe` is not on `Message`,
-  // so the pipeline's durable `extractive` model marker is the signal.
+  const label = engineLabel(message);
   const isFailsafe = message.model === "extractive";
-
-  const label = isFailsafe
-    ? "Extractive (no model)"
-    : isLocal
-      ? message.model
-        ? `Local · ${message.model}`
-        : "Local model"
-      : isFallback
-        ? `${capitalize(message.provider)} · Fallback`
-        : capitalize(message.provider || "unknown");
+  const isLocal = message.provider === "local";
 
   return (
     <span title={message.fallback_reason || undefined}>
@@ -583,9 +577,4 @@ function Metric({
       <dd className={cn("mt-0.5 font-mono text-xs tabular-nums text-ink", valueClass)}>{value}</dd>
     </div>
   );
-}
-
-function capitalize(value: string): string {
-  if (!value) return "Unknown";
-  return value.charAt(0).toUpperCase() + value.slice(1);
 }

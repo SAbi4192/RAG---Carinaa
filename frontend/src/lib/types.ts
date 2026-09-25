@@ -298,6 +298,8 @@ export interface AskRequest {
   use_rerank?: boolean | null;
   use_web_search?: boolean;
   language?: string;
+  /** Detailed Answer presentation style (see ANSWER_STYLES on the server). */
+  answer_style?: string;
 }
 
 export interface ConversationDetail {
@@ -383,7 +385,7 @@ export interface ShortenLevelInfo {
 
 export interface Variant {
   message_id: number;
-  kind: "translated" | "shortened" | "explanation" | string;
+  kind: "translated" | "shortened" | "explanation" | "detailed" | string;
   language: string;
   level: string;
   content: string;
@@ -536,41 +538,38 @@ export interface RetrieveCompareResponse {
 /* Settings                                                                    */
 /* ========================================================================== */
 
-export interface ProviderStatus {
-  name: string;
-  label: string;
-  /** primary | fallback | offline */
+/** One answer engine as the SERVER reports it: a ROLE, never a vendor.
+
+    The backend sanitises its provider chain down to these three roles
+    (app/core/sanitize.public_engines). A cloud implementation's name never
+    appears on this object - if one did, the type would have to say so, and it
+    does not, because the contract is that it must not.
+*/
+export interface EngineInfo {
+  /** "primary" | "fallback" | "offline" */
   role: string;
+  label: string;
+  /** Present only for the local model, which the user configured themselves. */
+  name?: string | null;
   configured: boolean;
   available: boolean;
-  model: string;
-  reason: string;
-  modes: string[];
+  reason?: string;
+  guarantee?: string;
 }
 
-export interface ModeStatus {
+export interface EngineModeStatus {
   available: boolean;
-  reason: string;
-  [key: string]: unknown;
+  reason?: string;
 }
 
-export interface ProviderReport {
-  providers: ProviderStatus[];
+export interface EngineReport {
+  engines: EngineInfo[];
   modes: {
-    online: ModeStatus & {
-      primary?: string;
-      fallback?: string;
-      primary_configured?: boolean;
-      fallback_configured?: boolean;
-    };
-    offline: ModeStatus & {
-      provider?: string;
-      model?: string;
-      model_present?: boolean;
-      guarantee?: string;
-    };
-    default_mode?: string;
+    online: EngineModeStatus;
+    offline: EngineModeStatus;
+    default_mode: string;
   };
+  note?: string;
 }
 
 export interface RagSettings {

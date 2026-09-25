@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from app.core.config import settings
 from app.core.deps import CurrentUser, DbSession
 from app.core.logging import get_logger
+from app.core.sanitize import local_model_name, public_engines
 from app.db.models import Chunk, Document, Message, QueryLog, Workspace
 from app.features.languages import as_list as languages_as_list
 from app.ingestion.pipeline import list_stage_definitions
@@ -97,24 +98,17 @@ def rag_configuration(_: CurrentUser) -> dict:
 
 @router.get("/providers")
 def providers(_: CurrentUser) -> dict:
-    """Provider status and which modes are usable right now."""
-    adapter = get_llm_adapter()
-    return {
-        "providers": [status.as_dict() for status in adapter.provider_statuses()],
-        "modes": adapter.mode_status(),
-    }
-
-
-@router.get("/providers/models")
-async def provider_models(_: CurrentUser) -> dict:
-    """Live model lists from each provider.
-
-    This is the mechanism that keeps model IDs from going stale: instead of
-    trusting a constant in the source, we ask the provider what it currently
-    offers and report whether the configured model still exists.
+    """Engine status expressed as ROLES: primary remote engine, backup remote
+    engine, local model. Cloud vendor identity is never sent to the browser; the
+    server still knows and logs it (app.core.sanitize is the single boundary).
     """
-    adapter = get_llm_adapter()
-    return await adapter.list_provider_models()
+    return public_engines()
+
+
+# No /providers/models route: it enumerated live cloud model IDs, which is vendor
+# identity, and nothing in the frontend or the tests called it. The adapter keeps
+# `list_provider_models()` for operator use (scripts, logs); it is simply not a
+# public endpoint any more.
 
 
 @router.post("/local-model/load")

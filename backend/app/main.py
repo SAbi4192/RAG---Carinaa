@@ -217,7 +217,23 @@ if _FRONTEND_DIST.is_dir():
                 response = None
 
             if response is None or response.status_code == 404:
-                return await super().get_response("index.html", scope)
+                response = await super().get_response("index.html", scope)
+
+            # The HTML document must always be revalidated. It is the one file that
+            # names the content-hashed JS/CSS bundles: if a browser or an old
+            # service worker serves a stale index.html after a rebuild, every chunk
+            # 404s and the page is a black screen. no-cache keeps the ETag
+            # revalidation (cheap, and it already works - the server sends ETag)
+            # but guarantees the shell itself is never answered from a stale cache.
+            # Hashed assets under /assets/ stay cacheable because their names change
+            # whenever their contents do.
+            if response.headers.get("content-type", "").startswith("text/html"):
+                response.headers["Cache-Control"] = "no-cache"
+            # The service worker script must revalidate too: the browser checks it
+            # for updates on navigation, but it must not answer that check from a
+            # cache set by the previous worker, or a stale shell never gets replaced.
+            if path == "sw.js" or path.endswith("/sw.js"):
+                response.headers["Cache-Control"] = "no-cache"
             return response
 
     app.mount(

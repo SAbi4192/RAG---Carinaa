@@ -40,6 +40,14 @@ from app.core.config import settings
 from app.core.deps import CurrentUser, DbSession
 from app.core.errors import CarinaaError, NotFound
 from app.core.logging import get_logger
+from app.core.sanitize import (
+    public_provider_label,
+    public_provenance,
+    public_trace_summary,
+    sanitize_event_dict,
+    sanitize_trace_data,
+)
+from app.core.sanitize import _scrub_text as _scrub
 from app.db.models import (
     AnswerVariant,
     Conversation,
@@ -61,7 +69,7 @@ from app.rag.references import (
     needs_document_clarification,
     resolve_relative_page,
 )
-from app.rag.understanding import detect_page_reference
+from app.rag.understanding import detect_page_range, detect_page_reference
 from app.rag.trace import TraceRecorder, stage_definitions
 from app.schemas.chat import (
     AskRequest,
@@ -176,14 +184,32 @@ def _page_range(db: DbSession, scope: list[int] | None, workspace_id: int) -> tu
 
     Used to answer "page 20 does not exist" honestly. Only reported when real
     metadata confirms it - guessing a page count would be worse than saying nothing.
+
+    `page_end` for the upper bound, not `page_number`. A short document becomes one
+    chunk covering several pages, so its `page_number` is 1 while its `page_end` is
+    the real last page. Using `page_number` for both bounds reported "pages 1 to 1"
+    for a four-page document and rejected every page question.
+
+    THE JSON PATH MUST BE CAST, NOT EXTRACTED RAW.
+    SQLAlchemy renders `doc_metadata["page_number"]` as
+    `JSON_QUOTE(JSON_EXTRACT(...))`, which wraps every value in quotes - numbers
+    become strings. MIN/MAX over quoted strings compare lexicographically, and the
+    `"null"` text produced by the unquoted NULL makes `MAX(page_end)` collapse to
+    the string `'null'` in any workspace that mixes PDF chunks with TXT/CSV/MD
+    chunks. That is what broke "What is on page 22 of ADT_Notes.pdf": the range
+    lookup returned (1, None), so Carinaa claimed the documents had no page
+    information even though all 176 PDF chunks carried it. `.as_integer()` (and
+    `.as_string()` for sections) emits a plain JSON_EXTRACT cast to the right SQL
+    type, which compares correctly and ignores NULLs.
     """
-    # `page_end` for the upper bound, not `page_number`. A short document becomes one
-    # chunk covering several pages, so its `page_number` is 1 while its `page_end` is
-    # the real last page. Using `page_number` for both bounds reported "pages 1 to 1"
-    # for a four-page document and rejected every page question.
     query = select(
-        func.min(Chunk.doc_metadata["page_number"]),
-        func.max(Chunk.doc_metadata["page_end"]),
+        func.min(Chunk.doc_metadata["page_number"].as_integer()),
+        # A chunk whose metadata lacks `page_end` still has a start page, so COALESCE
+        # keeps single-page chunks counted instead of dropping them to NULL.
+        func.max(func.coalesce(
+            Chunk.doc_metadata["page_end"].as_integer(),
+            Chunk.doc_metadata["page_number"].as_integer(),
+        )),
     )
     query = query.where(Chunk.workspace_id == workspace_id)
     if scope:
@@ -212,6 +238,33 @@ def _scope_filenames(db: DbSession, scope: list[int] | None, workspace_id: int) 
     return [name for (name,) in db.execute(query).all() if name]
 
 
+# File types whose chunks carry page metadata. PDF is the one that matters today;
+# the set is explicit rather than "everything except txt" so a future parser that
+# adds slides or sheets cannot be silently mislabelled.
+_PAGINATED_FILE_TYPES = frozenset({"pdf"})
+
+
+def _paginated_scope_filenames(
+    db: DbSession, scope: list[int] | None, workspace_id: int
+) -> list[str]:
+    """Filenames of in-scope documents that actually have pages.
+
+    Phase-11 rule: "What is on page 22?" must not be rejected merely because a TXT,
+    CSV or Markdown file shares the workspace. Those files have no pages at all, so
+    a page number can never mean them, and listing them as "which document did you
+    mean?" candidates is a false ambiguity. Only documents that can answer a page
+    question belong in the candidate set.
+    """
+    query = select(Document.original_filename).where(
+        Document.workspace_id == workspace_id,
+        Document.status == "ready",
+        Document.file_type.in_(sorted(_PAGINATED_FILE_TYPES)),
+    )
+    if scope:
+        query = query.where(Document.id.in_(list(scope)))
+    return [name for (name,) in db.execute(query).all() if name]
+
+
 def _scope_sections(db: DbSession, scope: list[int] | None, workspace_id: int) -> list[str]:
     """Distinct section titles in the documents retrieval may search.
 
@@ -220,7 +273,12 @@ def _scope_sections(db: DbSession, scope: list[int] | None, workspace_id: int) -
     question alone. Reading them from the indexed metadata means the feature works on
     whatever the documents actually contain, rather than on titles someone guessed at.
     """
-    query = select(Chunk.doc_metadata["section"]).where(Chunk.workspace_id == workspace_id)
+    # `.as_string()` for the same reason `_page_range` uses `.as_integer()`: the
+    # default JSON index operator wraps values in JSON_QUOTE, so a DISTINCT over
+    # it returns quoted strings and every section comparison downstream fails.
+    query = select(Chunk.doc_metadata["section"].as_string()).where(
+        Chunk.workspace_id == workspace_id
+    )
     if scope:
         query = query.where(Chunk.document_id.in_(list(scope)))
     try:
@@ -391,6 +449,7 @@ def get_conversation(
 
     variants_by_message: dict[int, list[dict]] = {}
     for variant in variants:
+        _vp, _vm = public_provenance(variant.provider, variant.model)
         variants_by_message.setdefault(variant.message_id, []).append(
             {
                 "kind": variant.kind,
@@ -399,8 +458,8 @@ def get_conversation(
                 "content": variant.content,
                 "citations": variant.citations or [],
                 "validation": variant.validation or {},
-                "provider": variant.provider,
-                "model": variant.model,
+                "provider": _vp,
+                "model": _vm,
             }
         )
 
@@ -463,8 +522,10 @@ class _AskContext:
     workspace_ready: int
     scope_names: list[str]
     requested_page: int | None
+    page_span: tuple[int, int] | None
     page_phrase: str
     relative_note: str
+    answer_style: str | None
     section_match: str | None
     section_is_relative: str | None
     conversation_history: list[dict[str, str]]
@@ -548,6 +609,16 @@ def _prepare_ask(
     requested_page, page_phrase, page_is_relative, page_direction = detect_page_reference(
         payload.question
     )
+    # A RANGE ("summarise pages 20-22") is tried only when no single page matched:
+    # `detect_page_reference` deliberately returns nothing for a range so the two
+    # matchers cannot both claim the same phrase and disagree about the number.
+    page_span: tuple[int, int] | None = None
+    if requested_page is None and not page_is_relative:
+        span_match = detect_page_range(payload.question)
+        if span_match is not None:
+            page_span = (span_match[0], span_match[1])
+            page_phrase = span_match[2]
+
     relative_note = ""
     if page_is_relative:
         resolved_page, relative_source = resolve_relative_page(
@@ -559,18 +630,32 @@ def _prepare_ask(
             page_is_relative = False
 
     scope_names = _scope_filenames(db, resolved_scope, workspace.id)
-    ambiguous = needs_document_clarification(payload.question, requested_page, scope_names)
+
+    # A page question can only be answered by a document that HAS pages, so the
+    # "which document did you mean?" test considers only paginated files. Passing
+    # the full scope list made "What is on page 22?" ambiguous whenever a TXT or
+    # CSV happened to share the workspace - a false ambiguity that rejected a
+    # perfectly answerable question.
+    page_target = requested_page if requested_page is not None else (
+        page_span[0] if page_span else None
+    )
+    paginated_names = _paginated_scope_filenames(db, resolved_scope, workspace.id)
+    ambiguous = needs_document_clarification(payload.question, page_target, paginated_names)
     if ambiguous is not None:
         raise CarinaaError(
             "Which document did you mean? This chat has "
-            f"{len(ambiguous)} documents in scope, and a page number alone does not "
-            "say which one to look in.",
+            f"{len(ambiguous)} documents with pages in scope, and a page number alone "
+            "does not say which one to look in.",
             code="ambiguous_document",
             status_code=400,
-            detail={"candidates": ambiguous, "requested_page": requested_page},
+            detail={
+                "candidates": ambiguous,
+                "requested_page": requested_page,
+                "requested_page_range": list(page_span) if page_span else None,
+            },
         )
 
-    if requested_page is not None:
+    if page_target is not None:
         span = _page_range(db, resolved_scope, workspace.id)
 
         if span is None:
@@ -580,17 +665,27 @@ def _prepare_ask(
                 "files, which are not paginated. Ask about the content instead.",
                 code="no_page_metadata",
                 status_code=400,
-                detail={"requested_page": requested_page, "page_metadata": False},
+                detail={"requested_page": page_target, "page_metadata": False},
             )
 
-        if not (span[0] <= requested_page <= span[1]):
+        # Bounds are checked for the whole requested range, not just its first page:
+        # "pages 60-70" of a 65-page PDF is partly answerable and must say so rather
+        # than pretend page 60 was the only request.
+        low_bound = page_span[0] if page_span else page_target
+        high_bound = page_span[1] if page_span else page_target
+        if not (span[0] <= low_bound and high_bound <= span[1]):
             raise CarinaaError(
                 f"The documents in scope have pages {span[0]} to {span[1]}, so "
-                f"page {requested_page} does not exist.",
+                + (
+                    f"pages {low_bound} to {high_bound} are not all available."
+                    if page_span
+                    else f"page {page_target} does not exist."
+                ),
                 code="page_out_of_range",
                 status_code=400,
                 detail={
                     "requested_page": requested_page,
+                    "requested_page_range": list(page_span) if page_span else None,
                     "available_pages": {"from": span[0], "to": span[1]},
                 },
             )
@@ -629,8 +724,10 @@ def _prepare_ask(
         workspace_ready=workspace_ready,
         scope_names=scope_names,
         requested_page=requested_page,
+        page_span=page_span,
         page_phrase=page_phrase,
         relative_note=relative_note,
+        answer_style=(payload.answer_style or "").strip().lower() or None,
         section_match=section_match,
         section_is_relative=section_is_relative,
         conversation_history=conversation_history,
@@ -702,6 +799,13 @@ def _annotate_trace(ctx: _AskContext, result: RAGAnswer) -> None:
             )
             if ctx.relative_note:
                 event.data["page_resolution"] = ctx.relative_note
+        elif ctx.page_span is not None:
+            event.data.update(
+                {
+                    "page_reference": ctx.page_phrase,
+                    "page_span_applied": list(ctx.page_span),
+                }
+            )
         if ctx.section_match:
             event.data["section_filter_applied"] = ctx.section_match
         if ctx.section_is_relative:
@@ -826,13 +930,19 @@ def _persist_assistant_turn(
         message=MessageOut.model_validate(assistant_message),
         conversation_id=ctx.conversation.id,
         answer=result.answer,
-        provider_label=result.provider_label(),
+        # Public label: role-based, never a cloud vendor name. The database row
+        # above keeps the real provenance; the browser does not get it.
+        provider_label=public_provider_label(
+            provider=result.provider,
+            model=result.model,
+            used_fallback=result.used_fallback,
+        ),
         is_extractive_failsafe=result.is_extractive_failsafe,
         grounding=grounding_out,
         citations=citations_out,
         retrieval=result.retrieval.as_dict() if result.retrieval else {},
         context=result.context.as_dict() if result.context else {},
-        trace=ctx.trace.summary(),
+        trace=public_trace_summary(ctx.trace.summary()),
         web_sources=ctx.web_sources,
     )
     return assistant_message, response
@@ -866,7 +976,9 @@ async def ask(payload: AskRequest, user: CurrentUser, db: DbSession) -> AskRespo
             trace=ctx.trace,
             history=ctx.conversation_history,
             page_number=ctx.requested_page,
+            page_span=ctx.page_span,
             section=ctx.section_match,
+            answer_style=ctx.answer_style,
         )
     except CarinaaError as exc:
         _persist_failure_trace(db, ctx, exc)
@@ -897,7 +1009,9 @@ def _annotated_error(exc: CarinaaError, ctx: _AskContext) -> CarinaaError:
     """
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     return CarinaaError(
-        exc.message,
+        # Provider failures surface as "tried: groq, gemini" style strings; the
+        # browser gets the role-based wording (see app.core.sanitize).
+        _scrub(exc.message),
         code=exc.code,
         status_code=exc.status_code,
         detail={
@@ -905,7 +1019,7 @@ def _annotated_error(exc: CarinaaError, ctx: _AskContext) -> CarinaaError:
             "failed": True,
             "question": ctx.question,
             "message_id": ctx.user_message.id,
-            "trace": ctx.trace.summary(),
+            "trace": public_trace_summary(ctx.trace.summary()),
         },
     )
 
@@ -985,7 +1099,9 @@ async def ask_stream(
                 "label": event.label,
                 "status": event.status,
                 "duration_ms": event.duration_ms,
-                "data": event.data,
+                # Live events are sanitized exactly like stored ones: the browser
+                # must never see a cloud provider or model ID on any path.
+                "data": sanitize_trace_data(event.stage, event.data),
                 "created_at": event.created_at.isoformat() if event.created_at else None,
             }
         )
@@ -1017,7 +1133,9 @@ async def ask_stream(
                 trace=ctx.trace,
                 history=ctx.conversation_history,
                 page_number=ctx.requested_page,
+                page_span=ctx.page_span,
                 section=ctx.section_match,
+                answer_style=ctx.answer_style,
             ):
                 if event["type"] == "delta":
                     _push_pipeline("token", text=event["text"])
@@ -1032,7 +1150,7 @@ async def ask_stream(
             _push_pipeline(
                 "stream_error",
                 error=CarinaaError(
-                    str(exc), code="internal_error", status_code=500
+                    _scrub(str(exc)), code="internal_error", status_code=500
                 ),
             )
 
@@ -1126,9 +1244,14 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
     # The same structural filters /chat/ask applies, so the labs demonstrate the real
     # behaviour rather than an approximation of it.
     requested_page = payload.page_number
+    requested_span: tuple[int, int] | None = None
     if requested_page is None:
         detected, _phrase, _relative, _direction = detect_page_reference(payload.question)
         requested_page = detected
+        if detected is None:
+            span_match = detect_page_range(payload.question)
+            if span_match is not None:
+                requested_span = (span_match[0], span_match[1])
 
     # Mirror the ask endpoint's unit handling. Without this the labs would show a
     # different search from what a real answer performs - the exact disagreement the
@@ -1147,6 +1270,7 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
         candidate_k=payload.candidate_k,
         document_ids=scope,
         page_number=requested_page,
+        page_span=requested_span,
         section=section_filter,
         use_rerank=payload.use_rerank,
         mode=payload.mode,
@@ -1160,7 +1284,7 @@ async def retrieve(payload: RetrieveRequest, user: CurrentUser, db: DbSession) -
     return RetrieveResponse(
         retrieval=outcome.get("retrieval", {}),
         context=outcome.get("context", {}),
-        trace=outcome.get("trace", {}),
+        trace=public_trace_summary(outcome.get("trace", {}) or {}),
         generated=False,
         note=str(outcome.get("note", "")),
     )
@@ -1211,6 +1335,11 @@ async def retrieve_compare(
         scope = _resolve_retrieval_scope(db, conversation.id, None)
 
     requested_page = detect_page_reference(payload.question)[0]
+    requested_span = None
+    if requested_page is None:
+        span_match = detect_page_range(payload.question)
+        if span_match is not None:
+            requested_span = (span_match[0], span_match[1])
     section_filter = match_unit_section(
         payload.question, _scope_sections(db, scope, workspace.id)
     )
@@ -1231,6 +1360,7 @@ async def retrieve_compare(
             candidate_k=payload.candidate_k,
             document_ids=scope,
             page_number=requested_page,
+            page_span=requested_span,
             section=section_filter,
             use_rerank=False,  # the lab compares RETRIEVERS, not re-rankers
             mode=mode,
@@ -1347,7 +1477,12 @@ def get_trace(message_id: int, user: CurrentUser, db: DbSession) -> TraceOut:
             "label": (event.event_data or {}).get("label", event.stage.replace("_", " ").title()),
             "status": event.status,
             "duration_ms": event.duration_ms,
-            "data": {k: v for k, v in (event.event_data or {}).items() if k != "label"},
+            # Same boundary as every other trace payload: stored events keep the
+            # real provider for developers; the browser never receives it.
+            "data": sanitize_trace_data(
+                event.stage,
+                {k: v for k, v in (event.event_data or {}).items() if k != "label"},
+            ),
             # Real wall-clock time from the stored event, so the trace can be read as a
             # log. Older rows predate this field and will simply have none.
             "created_at": event.created_at.isoformat() if event.created_at else None,
@@ -1355,6 +1490,7 @@ def get_trace(message_id: int, user: CurrentUser, db: DbSession) -> TraceOut:
         for event in events
     ]
 
+    _summary_provider, _summary_model = public_provenance(message.provider, message.model)
     return TraceOut(
         trace_id=message.trace_id,
         message_id=message.id,
@@ -1367,8 +1503,13 @@ def get_trace(message_id: int, user: CurrentUser, db: DbSession) -> TraceOut:
         # that is not the latest turn.
         question=_question_for(db, message),
         summary={
-            "provider": message.provider,
-            "model": message.model,
+            "provider": _summary_provider,
+            "model": _summary_model,
+            "provider_label": public_provider_label(
+                provider=message.provider,
+                model=message.model,
+                used_fallback=message.used_fallback,
+            ),
             "used_fallback": message.used_fallback,
             "ai_mode": message.ai_mode,
             "grounding_status": message.grounding_status,
@@ -1426,13 +1567,26 @@ def export_evidence_pack(
         for event in events
     ]
 
+    # The exported pack is a user-facing artifact: same provenance rule as the API
+    # (role labels and the local model name, never a cloud vendor identity). The
+    # renderer prints `provider` verbatim, so it receives the finished label.
     common = {
         "question": question,
         "answer": message.content,
-        "provider": message.provider or "",
-        "model": message.model or "",
+        "provider": public_provider_label(
+            provider=message.provider,
+            model=message.model,
+            used_fallback=message.used_fallback,
+        ),
+        # The label above already carries the local model name; the renderer joins
+        # `provider · model`, so leaving this empty avoids printing it twice.
+        "model": "",
         "used_fallback": bool(message.used_fallback),
-        "fallback_reason": message.fallback_reason or "",
+        # Scrubbed too: a stored reason can read "Groq returned 429", which is
+        # developer log text, not something to print in an exported document.
+        "fallback_reason": _scrub(message.fallback_reason or "")
+        if message.provider != "local"
+        else (message.fallback_reason or ""),
         "is_extractive": (message.model or "") == "extractive",
         "ai_mode": message.ai_mode or "online",
         "grounding": message.grounding_detail or None,

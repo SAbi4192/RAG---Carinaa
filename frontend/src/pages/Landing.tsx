@@ -54,7 +54,7 @@ const PIPELINE_QUERY = [
   { step: "Retrieve", detail: "cosine search, filtered" },
   { step: "Re-rank", detail: "optional, off by default" },
   { step: "Build context", detail: "numbered, budgeted" },
-  { step: "Generate", detail: "Groq → Gemini, or local" },
+  { step: "Generate", detail: "remote or local engine" },
   { step: "Ground", detail: "is it actually supported?" },
   { step: "Cite", detail: "resolve [n] → real passage" },
 ];
@@ -243,7 +243,7 @@ export default function Landing() {
                       Supported
                     </Badge>
                     <Badge tone="neutral" mono>
-                      Groq · 1.4 s
+                      Remote · 1.4 s
                     </Badge>
                     <Badge tone="accent" mono>
                       6 chunks retrieved

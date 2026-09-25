@@ -73,6 +73,14 @@ _RELATIVE_PAGE = re.compile(
     r"\b(previous|last|next|following|current|same)\s+page\b", re.IGNORECASE
 )
 
+# Page RANGES: "pages 20-22", "pages 21 to 25", "p.10 - 15".
+# Tried BEFORE the single-page patterns, which would otherwise match only the
+# first number and silently drop the rest of the range.
+_PAGE_RANGE = re.compile(
+    r"\b(?:pages?|p\.?)\s*(?:no\.?\s*)?(\d{1,4})\s*(?:to|through|-|–|—)\s*(?:pages?\s*)?(\d{1,4})\b",
+    re.IGNORECASE,
+)
+
 # Signals that a question cannot stand alone. Deliberately narrow.
 #
 # The asymmetry matters: rewriting an independent question into something the user
@@ -159,6 +167,11 @@ def detect_page_reference(question: str) -> tuple[int | None, str, bool, str]:
     if relative:
         return None, relative.group(0), True, relative.group(1).lower()
 
+    # A range ("pages 20-22") is handled by detect_page_range; if one is present,
+    # the single-page matcher must not report just its first number.
+    if detect_page_range(question) is not None:
+        return None, "", False, ""
+
     for pattern, kind in _PAGE_PATTERNS:
         match = re.search(pattern, question, re.IGNORECASE)
         if not match:
@@ -178,6 +191,29 @@ def detect_page_reference(question: str) -> tuple[int | None, str, bool, str]:
             return value, match.group(0), False, ""
 
     return None, "", False, ""
+
+
+def detect_page_range(question: str) -> tuple[int, int, str] | None:
+    """Find an explicit page RANGE: "pages 20-22", "pages 21 to 25", "p.10 - 15".
+
+    Returns (first_page, last_page, matched_phrase) or None. Only a genuinely
+    ordered range (first <= last, both positive) is accepted; a reversed pair is
+    treated as no range rather than silently swapped, because the honest reading of
+    "pages 22-20" is not a retrieval filter we should invent.
+    """
+    match = _PAGE_RANGE.search(question)
+    if not match:
+        return None
+    try:
+        first, last = int(match.group(1)), int(match.group(2))
+    except ValueError:
+        return None
+    if first <= 0 or last <= 0 or last < first:
+        return None
+    # A one-page "range" is just a page reference; let the single matcher own it.
+    if first == last:
+        return None
+    return first, last, match.group(0)
 
 
 def needs_conversation_context(question: str, history_length: int) -> bool:

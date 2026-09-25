@@ -329,24 +329,31 @@ class LLMAdapter:
         raise AllProvidersFailed()  # unreachable, keeps type checkers happy
 
     def _raise_online_failure(self, attempts: list[str], primary_error: LLMError | None) -> None:
-        """Turn a pile of provider errors into one useful message."""
+        """Turn a pile of provider errors into one useful message.
+
+        ROLE-BASED WORDING ONLY. These strings are returned to the browser through
+        the error envelope, so they name engines by role (primary / backup remote
+        engine), never by vendor (app/core/sanitize.py enforces the same rule for
+        structured fields; this is the same rule applied to prose). The key names a
+        user needs live in `.env.example` and the Quick Start, not in error toasts.
+        """
         if not self.groq.configured and not self.gemini.configured:
             raise ProviderNotConfigured(
-                "No online AI provider is configured on the server. Add GROQ_API_KEY "
-                "(and optionally GEMINI_API_KEY as a fallback) to the .env file, or switch "
-                "to Offline mode."
+                "No remote answer engine is configured on this server. Add one or "
+                "more engine keys to the .env file (see Quick Start -> Environment "
+                "configuration), or switch to Offline mode."
             )
 
         if isinstance(primary_error, RateLimitedError):
             raise ProviderRateLimited(
-                "The AI providers are rate limiting us right now. Please wait a moment "
-                "and try again, or switch to Offline mode."
+                "The answer engines are temporarily rate limited. Please wait a "
+                "moment and try again, or switch to Offline mode."
             )
 
-        detail = ", ".join(attempts) if attempts else "none configured"
         raise AllProvidersFailed(
-            f"No AI provider could complete this request (tried: {detail}). "
-            f"Check the provider status on the Settings page."
+            "The remote answer engines are temporarily unavailable. The primary "
+            "engine and its backup were both tried. Check the engine status on "
+            "the Settings page, or switch to Offline mode."
         )
 
     async def _with_retry(self, func, messages, temperature, max_tokens) -> LLMResponse:

@@ -60,7 +60,7 @@ from app.rag.citations import (
 from app.rag.context import ContextBundle, build_context, context_stats
 from app.rag.failsafe import build_extractive_answer
 from app.rag.grounding import GroundingResult, check_grounding
-from app.rag.prompts import build_generation_messages
+from app.rag.prompts import ANSWER_STYLES, build_generation_messages
 from app.rag.retriever import RetrievalOutcome, get_retriever
 from app.rag.units import expand_unit_reference
 from app.rag.understanding import (
@@ -144,11 +144,18 @@ class RAGAnswer:
         }
 
     def provider_label(self) -> str:
-        """What the UI shows. A fallback is never disguised as the primary."""
+        """Internal, developer-facing label. A fallback is never disguised as the primary.
+
+        This keeps the REAL provider name because it is used for server-side logging
+        and the database. What the browser receives is the sanitized, role-based label
+        from `app.core.sanitize.public_provider_label` - the routes never send this.
+        """
         if self.is_extractive_failsafe:
             return "Extractive (no model)"
         if self.provider == "local":
-            return f"Local · {settings.local_model_label}"
+            from app.core.sanitize import local_model_name
+
+            return f"Local · {local_model_name()}"
         if self.used_fallback:
             return f"{self.provider.title()} · Fallback"
         return self.provider.title() if self.provider else "Unknown"
@@ -198,6 +205,7 @@ class RAGPipeline:
         trace: TraceRecorder,
         history: list[dict[str, str]] | None,
         page_number: int | None,
+        page_span: tuple[int, int] | None = None,
         section: str | None,
     ) -> _Prepared:
         """Understand the question, retrieve, and build the context bundle.
@@ -247,6 +255,7 @@ class RAGPipeline:
                 top_k=top_k,
                 candidate_k=candidate_k,
                 page_number=page_number,
+                page_span=page_span,
                 section=section,
                 document_ids=document_ids,
                 use_rerank=use_rerank,
@@ -387,10 +396,19 @@ class RAGPipeline:
         trace: TraceRecorder | None = None,
         history: list[dict[str, str]] | None = None,
         page_number: int | None = None,
+        page_span: tuple[int, int] | None = None,
         section: str | None = None,
         understanding: dict[str, Any] | None = None,
+        answer_style: str | None = None,
     ) -> RAGAnswer:
-        """Produce a grounded, cited answer."""
+        """Produce a grounded, cited answer.
+
+        `answer_style` is an optional presentation format requested from the
+        Detailed Answer menu (more_detail | mark8 | mark16 | mark20 | university).
+        Retrieval is untouched: a long exam-style answer is built from exactly the
+        same evidence as the short one, because inventing length without inventing
+        facts is only possible when the evidence is honest.
+        """
         started = time.perf_counter()
         trace = trace or TraceRecorder()
         result = RAGAnswer(question=question, answer="", mode=mode, trace=trace)
@@ -408,6 +426,7 @@ class RAGPipeline:
             trace=trace,
             history=history,
             page_number=page_number,
+            page_span=page_span,
             section=section,
         )
 
@@ -415,6 +434,14 @@ class RAGPipeline:
         # GENERATION
         # =================================================================
         generation_started = time.perf_counter()
+        # A requested style brings its own output budget and temperature (see
+        # ANSWER_STYLES): a 20-mark answer cannot be written inside the default
+        # token limit, and exam prose wants lower temperature than general chat.
+        style = ANSWER_STYLES.get((answer_style or "").strip().lower())
+        # Live begin: generation is the slowest stage, and the only way the UI can
+        # show it as genuinely running (rather than a timed guess). The adapter's
+        # `add()` closes this same event with the real provider outcome.
+        trace.begin("llm_generation")
         try:
             llm_response: LLMResponse = await self.adapter.generate(
                 build_generation_messages(
@@ -424,8 +451,11 @@ class RAGPipeline:
                     language=language,
                     web_sources=web_sources,
                     mode=mode,
+                    answer_style=answer_style,
                 ),
                 mode=mode,
+                temperature=style["temperature"] if style else None,
+                max_tokens=style["max_tokens"] if style else None,
                 trace=trace,
             )
             result.answer = llm_response.text
@@ -464,7 +494,9 @@ class RAGPipeline:
         trace: TraceRecorder | None = None,
         history: list[dict[str, str]] | None = None,
         page_number: int | None = None,
+        page_span: tuple[int, int] | None = None,
         section: str | None = None,
+        answer_style: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Answer a question, yielding REAL text deltas as the provider produces them.
 
@@ -498,6 +530,7 @@ class RAGPipeline:
             trace=trace,
             history=history,
             page_number=page_number,
+            page_span=page_span,
             section=section,
         )
 
@@ -508,14 +541,30 @@ class RAGPipeline:
             language=language,
             web_sources=web_sources,
             mode=mode,
+            answer_style=answer_style,
         )
 
         generation_started = time.perf_counter()
         meta: dict[str, Any] = {}
         parts: list[str] = []
 
+        # Live begin, mirroring the buffered path: the stage reads as running
+        # while the first token is still on its way. The `add()` after the stream
+        # (or the adapter's own attempt events) closes this same seq.
+        if trace:
+            trace.begin("llm_generation")
+
         try:
-            async for fragment in self.adapter.stream(messages, mode=mode, meta=meta):
+            # Same style budget as the buffered path: a streamed exam answer needs
+            # the same room as a buffered one, or it truncates mid-heading.
+            style = ANSWER_STYLES.get((answer_style or "").strip().lower())
+            async for fragment in self.adapter.stream(
+                messages,
+                mode=mode,
+                temperature=style["temperature"] if style else None,
+                max_tokens=style["max_tokens"] if style else None,
+                meta=meta,
+            ):
                 parts.append(fragment)
                 yield {"type": "delta", "text": fragment}
 
@@ -660,6 +709,7 @@ async def retrieve_only(
     candidate_k: int | None = None,
     document_ids: Sequence[int] | None = None,
     page_number: int | None = None,
+    page_span: tuple[int, int] | None = None,
     section: str | None = None,
     use_rerank: bool | None = None,
     mode: str | None = None,
@@ -680,6 +730,7 @@ async def retrieve_only(
             workspace_id=workspace_id,
             question=question,
             page_number=page_number,
+            page_span=page_span,
             section=section,
             top_k=top_k,
             candidate_k=candidate_k,

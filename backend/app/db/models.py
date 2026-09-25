@@ -339,8 +339,10 @@ class Message(Base):
 class AnswerVariant(Base):
     """A presentation transform of a canonical answer.
 
-    kind = translated | shortened
-    Cached so switching language or condensing level is instant the second time.
+    kind = translated | shortened | detailed | explanation
+    Cached so switching language, condensing level or Detailed Answer style is
+    instant the second time. `level` holds the detailed style key when the kind
+    is "detailed".
     """
 
     __tablename__ = "answer_variants"

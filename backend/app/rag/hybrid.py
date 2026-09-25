@@ -304,6 +304,7 @@ def bm25_corpus_for_workspace(
     *,
     document_ids: Sequence[int] | None = None,
     page_number: int | None = None,
+    page_span: tuple[int, int] | None = None,
     section: str | None = None,
 ) -> list[RetrievedChunk]:
     """All indexed chunks for this query's population, as RetrievedChunks.
@@ -344,6 +345,19 @@ def bm25_corpus_for_workspace(
             if page is None:
                 continue
             if not (int(page) <= int(page_number) <= int(page_end)):
+                continue
+        elif page_span is not None:
+            # Range coverage, the same test `VectorStore._scope_filter` applies:
+            # a chunk overlaps [first, last] when it starts at or before `last`
+            # and ends at or after `first`. Non-paginated chunks (page is None)
+            # cannot overlap a page range and are excluded, exactly as the dense
+            # filter's scalar-metadata comparison does.
+            page = metadata.get("page_number")
+            if page is None:
+                continue
+            page_end = metadata.get("page_end") or page
+            first, last = int(page_span[0]), int(page_span[1])
+            if not (int(page) <= last and int(page_end) >= first):
                 continue
         if section is not None and str(metadata.get("section") or "") != section:
             continue

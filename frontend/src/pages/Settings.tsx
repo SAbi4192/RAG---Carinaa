@@ -160,6 +160,9 @@ export default function Settings() {
   }, [security]);
 
   const modes = providers.data?.modes;
+  const engines = providers.data?.engines ?? [];
+  const engineOf = (role: string) => engines.find((engine) => engine.role === role);
+  const localEngine = engineOf("offline");
 
   return (
     <>
@@ -198,8 +201,8 @@ export default function Settings() {
                       <Cpu className="h-4 w-4" />
                     </span>
                     <div>
-                      <h3 className="text-sm font-semibold text-ink">Online mode</h3>
-                      <p className="text-2xs text-faint">Gemini primary · Groq fallback</p>
+                      <h3 className="text-sm font-semibold text-ink">Remote answer engines</h3>
+                      <p className="text-2xs text-faint">Primary · Backup fallback</p>
                     </div>
                   </div>
                   <AvailabilityPill available={Boolean(modes?.online?.available)} />
@@ -207,21 +210,21 @@ export default function Settings() {
 
                 <p className="mt-3 text-2xs leading-relaxed text-muted">
                   {modes?.online?.available
-                    ? "At least one hosted provider is configured. If Gemini fails, Groq answers - and the answer is labelled as a fallback."
+                    ? "At least one remote engine is configured. If the primary engine is unavailable, the backup answers - and the response is labelled as a fallback."
                     : modes?.online?.reason ||
-                      "No hosted provider is configured. Set GEMINI_API_KEY on the server to enable online mode."}
+                      "No remote answer engine is configured on this server. Online mode needs one configured there."}
                 </p>
 
                 <div className="mt-3 space-y-2 border-t border-line pt-3">
                   <ProviderLine
-                    label="Primary"
-                    name={String(modes?.online?.primary ?? "gemini")}
-                    configured={Boolean(modes?.online?.primary_configured)}
+                    label="Primary engine"
+                    name={engineOf("primary")?.label ?? "Remote answer engine"}
+                    configured={Boolean(engineOf("primary")?.configured)}
                   />
                   <ProviderLine
-                    label="Fallback"
-                    name={String(modes?.online?.fallback ?? "groq")}
-                    configured={Boolean(modes?.online?.fallback_configured)}
+                    label="Backup engine"
+                    name={engineOf("fallback")?.label ?? "Backup answer engine"}
+                    configured={Boolean(engineOf("fallback")?.configured)}
                   />
                 </div>
               </Card>
@@ -233,9 +236,14 @@ export default function Settings() {
                       <WifiOff className="h-4 w-4" />
                     </span>
                     <div>
-                      <h3 className="text-sm font-semibold text-ink">Offline mode</h3>
+                      <h3 className="text-sm font-semibold text-ink">Local model</h3>
                       <p className="text-2xs text-faint">
-                        {String(modes?.offline?.model ?? "local model")}
+                        {/* The model NAME is the user's own configuration, so it is
+                            shown; it is resolved by the backend from whatever GGUF
+                            is actually present - never hard-coded here. */}
+                        {localEngine?.configured && localEngine.name
+                          ? localEngine.name
+                          : "No local model configured"}
                       </p>
                     </div>
                   </div>
@@ -243,7 +251,8 @@ export default function Settings() {
                 </div>
 
                 <p className="mt-3 text-2xs leading-relaxed text-muted">
-                  {String(modes?.offline?.guarantee ?? "")}
+                  {localEngine?.guarantee ||
+                    "When the local model is available, answers are produced entirely on this machine."}
                 </p>
 
                 <div className="mt-3 flex items-center gap-2 border-t border-line pt-3">
@@ -272,11 +281,11 @@ export default function Settings() {
               </Card>
             </div>
 
-            {/* provider table */}
+            {/* engine status table */}
             <Card>
               <CardHeader
-                title="Provider status"
-                description="Live availability. No credentials are ever returned by the API."
+                title="Answer engine status"
+                description="Live availability, reported by role. Cloud implementation identity and credentials never leave the server."
                 icon={<Server className="h-4 w-4" />}
                 actions={
                   <Button
@@ -290,53 +299,55 @@ export default function Settings() {
                 }
               />
               {providers.loading ? (
-                <LoadingPanel message="Checking providers…" />
+                <LoadingPanel message="Checking engines..." />
               ) : providers.error ? (
                 <div className="p-5">
                   <ErrorState message={providers.error} onRetry={providers.reload} />
                 </div>
               ) : (
                 <ul className="divide-y divide-line">
-                  {(providers.data?.providers ?? []).map((provider) => (
+                  {engines.map((engine) => (
                     <li
-                      key={provider.name}
+                      key={engine.role}
                       className="flex flex-wrap items-center gap-3 px-5 py-3.5"
                     >
-                      <StatusDot tone={provider.available ? "positive" : "neutral"} />
+                      <StatusDot tone={engine.available ? "positive" : "neutral"} />
 
                       <div className="min-w-0 flex-1">
                         <p className="flex flex-wrap items-center gap-2 text-xs font-medium text-ink">
-                          {provider.label}
+                          {engine.label}
                           <Badge
                             tone={
-                              provider.role === "primary"
+                              engine.role === "primary"
                                 ? "brand"
-                                : provider.role === "fallback"
+                                : engine.role === "fallback"
                                   ? "caution"
                                   : "accent"
                             }
                           >
-                            {provider.role}
+                            {engine.role}
                           </Badge>
                         </p>
-                        {provider.model ? (
+                        {/* Only the LOCAL model shows a name - it is the user's own
+                            configured file. Remote engines show none by design. */}
+                        {engine.name ? (
                           <p className="mt-0.5 font-mono text-2xs text-faint">
-                            {provider.model}
+                            {engine.name}
                           </p>
                         ) : null}
-                        {provider.reason ? (
+                        {engine.reason ? (
                           <p className="mt-1 text-2xs leading-relaxed text-muted">
-                            {provider.reason}
+                            {engine.reason}
                           </p>
                         ) : null}
                       </div>
 
                       <div className="flex shrink-0 items-center gap-1.5">
-                        <Badge tone={provider.configured ? "positive" : "neutral"}>
-                          {provider.configured ? "configured" : "not configured"}
+                        <Badge tone={engine.configured ? "positive" : "neutral"}>
+                          {engine.configured ? "configured" : "not configured"}
                         </Badge>
-                        <Badge tone={provider.available ? "positive" : "caution"}>
-                          {provider.available ? "available" : "unavailable"}
+                        <Badge tone={engine.available ? "positive" : "caution"}>
+                          {engine.available ? "available" : "unavailable"}
                         </Badge>
                       </div>
                     </li>

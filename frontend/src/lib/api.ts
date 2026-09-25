@@ -36,13 +36,13 @@ import type {
   DocumentList,
   DocumentProgress,
   DocumentRecord,
+  EngineReport,
   ExplainPayload,
   Grounding,
   LabEmbedResponse,
   LabStagesResponse,
   Language,
   PreviewChunksResponse,
-  ProviderReport,
   RagSettings,
   RetrieveCompareResponse,
   RetrieveResponse,
@@ -636,6 +636,14 @@ export const api = {
         body: { message_id: messageId, level },
       }),
 
+    // Detailed Answer: exam-shaped re-presentation of a stored answer, built
+    // from the SAME evidence, with citations re-validated server-side.
+    detailed: (messageId: number, style: string) =>
+      request<Variant>("/features/detailed-answer", {
+        method: "POST",
+        body: { message_id: messageId, style },
+      }),
+
     speech: (messageId: number, language = "en") =>
       request<SpeechPayload>("/features/speech", {
         method: "POST",
@@ -659,8 +667,9 @@ export const api = {
   settings: {
     all: () => request<Record<string, unknown>>("/settings"),
     rag: () => request<RagSettings>("/settings/rag"),
-    providers: () => request<ProviderReport>("/settings/providers"),
-    providerModels: () => request<Record<string, unknown>>("/settings/providers/models"),
+    /** Answer ENGINES as roles: primary / fallback / local. Vendor identity
+     *  never crosses to the browser (see backend app/core/sanitize.py). */
+    providers: () => request<EngineReport>("/settings/providers"),
     loadLocalModel: () =>
       request<Record<string, unknown>>("/settings/local-model/load", { method: "POST" }),
     unloadLocalModel: () =>

@@ -38,6 +38,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = BACKEND_DIR.parent
 
+# The label shipped with this repository's model file. Kept as a named constant so
+# `LocalProvider.resolved_label()` can tell "the operator configured a label" apart
+# from "nobody changed the default".
+DEFAULT_LOCAL_MODEL_LABEL = "Qwen2.5-3B-Instruct (Q4_K_M)"
+
 
 class Settings(BaseSettings):
     """All Carinaa runtime settings.
@@ -341,6 +346,17 @@ class Settings(BaseSettings):
         except OSError:
             return 0.0
 
+    def public_local_model_name(self) -> str:
+        """The configured local model's display name, resolved dynamically.
+
+        Imported lazily because `app.llm.local` imports this module; a top-level
+        import would be circular. Returns "Configured local model" when the name
+        cannot be determined. Never an absolute path.
+        """
+        from app.llm.local import get_local_provider
+
+        return get_local_provider().resolved_label()
+
     def redacted_summary(self) -> dict:
         """Safe-to-serve configuration summary.
 
@@ -380,21 +396,24 @@ class Settings(BaseSettings):
                 "default": self.default_ai_mode,
                 "offline_extractive_failsafe": self.offline_extractive_failsafe,
             },
+            # Role-based engine summary. Cloud vendor names, cloud model IDs and
+            # absolute filesystem paths are developer information; the browser gets
+            # the same facts expressed as roles (see app/core/sanitize.py). The real
+            # values remain available server-side through `settings.groq_model` etc.
             "providers": {
-                "groq": {
+                "primary_remote": {
                     "configured": self.groq_configured,
-                    "model": self.groq_model,
                     "role": "primary",
                 },
-                "gemini": {
+                "fallback_remote": {
                     "configured": self.gemini_configured,
-                    "model": self.gemini_model,
                     "role": "fallback",
                 },
                 "local": {
                     "available": self.local_model_present,
-                    "model": self.local_model_label,
-                    "path": str(self.local_model_path),
+                    # Dynamic: whatever GGUF is actually configured (see
+                    # LocalProvider.resolved_label). Never an absolute path.
+                    "model": self.public_local_model_name() if self.local_model_present else "",
                     "size_gb": self.local_model_size_gb(),
                     "context": self.local_n_ctx,
                     "gpu_layers": self.local_n_gpu_layers,

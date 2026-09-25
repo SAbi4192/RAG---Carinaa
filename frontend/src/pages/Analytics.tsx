@@ -922,9 +922,15 @@ function Legend({ color, label }: { color: string; label: string }) {
  * one that matters: it is the difference between a question leaving the machine
  * and not leaving it.
  */
+/**
+ * Engine names arrive as role labels ("Remote answer engine", "Local model",
+ * "Extractive (no model)") - the backend aggregates by role so no cloud vendor
+ * ever reaches this page. Pass through with light normalisation only.
+ */
 function providerLabel(name: string): string {
   if (name === "local") return "Local model (offline)";
   if (name === "offline") return "Offline";
+  if (!name || name === "unknown") return "Unrecorded";
   return name;
 }
 

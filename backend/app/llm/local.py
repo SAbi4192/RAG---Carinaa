@@ -70,6 +70,69 @@ def _default_threads() -> int:
         return 4
 
 
+def _read_gguf_string_fields(path: Path, wanted: tuple[str, ...]) -> dict[str, str]:
+    """Read selected string fields from a GGUF file header without loading weights.
+
+    The GGUF KV section is a small binary preamble, so this is cheap. It is the
+    mechanism that makes the displayed local model DYNAMIC: it reports what the
+    file on disk actually is, rather than the name hardcoded in the repository.
+    Mirrors scripts/inspect_gguf.py; kept here so the runtime never has to import
+    from a script directory.
+    """
+    import struct
+
+    def _read_str(f) -> str:
+        (n,) = struct.unpack("<Q", f.read(8))
+        return f.read(n).decode("utf-8", "replace")
+
+    fixed = {
+        0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
+        10: "<Q", 11: "<q", 12: "<d",
+    }
+
+    found: dict[str, str] = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            return found
+        (version,) = struct.unpack("<I", f.read(4))
+        if version < 2:
+            # v1 stored 32-bit counts; supporting only v2+ keeps this reader small.
+            return found
+        _n_tensors = struct.unpack("<Q", f.read(8))[0]
+        (n_kv,) = struct.unpack("<Q", f.read(8))
+
+        def read_value(t: int):
+            if t == 8:
+                return _read_str(f)
+            if t == 9:  # array
+                (elem_t,) = struct.unpack("<I", f.read(4))
+                (count,) = struct.unpack("<Q", f.read(8))
+                for _ in range(count):
+                    read_value(elem_t)
+                return None
+            fmt = fixed.get(t)
+            if fmt is None:
+                raise ValueError(f"unknown GGUF type {t}")
+            f.read(struct.calcsize(fmt))
+            return None
+
+        for _ in range(n_kv):
+            key = _read_str(f)
+            (vtype,) = struct.unpack("<I", f.read(4))
+            if key in wanted and vtype == 8:
+                (n,) = struct.unpack("<Q", f.read(8))
+                found[key] = f.read(n).decode("utf-8", "replace").strip()
+            else:
+                read_value(vtype)
+            if len(found) == len(wanted):
+                break
+    return found
+
+
+def _read_gguf_general_name(path: Path) -> str:
+    return _read_gguf_string_fields(path, ("general.name",)).get("general.name", "")
+
+
 class LocalProvider:
     """Offline generation via llama.cpp. No network, ever."""
 
@@ -98,6 +161,7 @@ class LocalProvider:
         self._load_error: str | None = None
         self._loaded_at: float | None = None
         self._load_seconds: float | None = None
+        self._gguf_meta_cache: dict[str, str] | None = None
 
     # ------------------------------------------------------------------ status
     @property
@@ -110,6 +174,61 @@ class LocalProvider:
     @property
     def is_loaded(self) -> bool:
         return self._llm is not None
+
+    # --------------------------------------------------------- model identity
+    def resolved_label(self) -> str:
+        """The name to SHOW for the configured local model. Never invented, never a path.
+
+        Different users put a different GGUF in `models/`, so the old behaviour -
+        displaying the hard-coded `LOCAL_MODEL_LABEL` default - lied about the model
+        for anyone who did not ship the repo's Qwen file. Resolution order:
+
+          1. `LOCAL_MODEL_LABEL`, but only when it was EXPLICITLY configured (i.e.
+             it differs from the shipped default). An untouched default must not
+             override reality.
+          2. the model's OWN embedded GGUF metadata (`general.name`), which is the
+             authoritative name whatever file was placed on disk;
+          3. the shipped default label, which is honest for the shipped file;
+          4. "Configured local model" - when nothing can be determined.
+        """
+        from app.core.config import DEFAULT_LOCAL_MODEL_LABEL
+
+        configured = (settings.local_model_label or "").strip()
+        if configured and configured != DEFAULT_LOCAL_MODEL_LABEL:
+            return configured
+        gguf_name = self._gguf_name()
+        if gguf_name:
+            return gguf_name
+        if self.model_present and configured == DEFAULT_LOCAL_MODEL_LABEL:
+            # The shipped label belongs to the shipped model; keep it for that file.
+            return configured
+        # No file (or an unreadable header) and no explicit label: the shipped
+        # default must NOT masquerade as the configured model. There is no model
+        # here to name, so say the honest thing instead of "Qwen…".
+        if configured and configured != DEFAULT_LOCAL_MODEL_LABEL:
+            return configured
+        return "Configured local model"
+
+    def _gguf_name(self) -> str:
+        """`general.name` from the GGUF header, or "". Read once, then cached."""
+        return self._gguf_metadata().get("general.name", "")
+
+    def _gguf_metadata(self) -> dict[str, str]:
+        """Selected string fields from the GGUF header, cached after first read."""
+        if self._gguf_meta_cache is not None:
+            return self._gguf_meta_cache
+
+        meta: dict[str, str] = {}
+        try:
+            if self.model_present:
+                meta = _read_gguf_string_fields(
+                    self.model_path,
+                    wanted=("general.name", "general.architecture"),
+                )
+        except Exception:  # noqa: BLE001 - a missing/odd header must not break status
+            meta = {}
+        self._gguf_meta_cache = meta
+        return meta
 
     def status(self) -> ProviderStatus:
         present = self.model_present
@@ -127,7 +246,7 @@ class LocalProvider:
             role=self.role,
             configured=present,
             available=available,
-            model=settings.local_model_label,
+            model=self.resolved_label() if present else settings.local_model_label,
             reason=reason,
             modes=("offline",),
         )
@@ -411,10 +530,17 @@ class LocalProvider:
         except OSError:
             pass
 
+        meta = self._gguf_metadata()
         return {
             "name": self.name,
-            "label": settings.local_model_label,
-            "model_path": str(self.model_path),
+            # Dynamic display name: explicit label -> GGUF `general.name` -> the
+            # honest fallback. This is the object the frontend shows for the local
+            # engine, so it must never contain the default Qwen string when the
+            # operator configured something else.
+            "label": self.resolved_label(),
+            # Only the FILE NAME, never an absolute path: the browser needs to help
+            # the user recognise which file is configured, not browse the disk.
+            "model_file": self.model_path.name if self.model_present else "",
             "model_present": self.model_present,
             "size_gb": size_gb,
             "loaded": self.is_loaded,
@@ -426,9 +552,12 @@ class LocalProvider:
             "max_tokens": settings.local_max_tokens,
             "offline": True,
             "makes_network_calls": False,
-            "architecture": "qwen2",
-            "quantization": "Q4_K_M",
-            "parameters": "3.4B",
+            # Architecture/quantization are READ FROM THE FILE, not asserted here:
+            # the old hardcoded "qwen2 / Q4_K_M / 3.4B" lied for every other GGUF a
+            # user might place in models/. When the header does not carry a field,
+            # it is reported as unknown rather than guessed.
+            "architecture": meta.get("general.architecture", "") or "unknown",
+            "quantization": meta.get("general.file_type", "") or "unknown",
         }
 
 

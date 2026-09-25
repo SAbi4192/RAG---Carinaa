@@ -296,6 +296,7 @@ class VectorStore:
         top_k: int = 5,
         document_ids: Sequence[int] | None = None,
         page_number: int | None = None,
+        page_span: tuple[int, int] | None = None,
         section: str | None = None,
     ) -> list[RetrievedChunk]:
         """Nearest-neighbour search, hard-scoped to one workspace.
@@ -310,7 +311,9 @@ class VectorStore:
             return []
 
         collection = self._ensure_collection()
-        where = self._scope_filter(workspace_id, document_ids, page_number, section)
+        where = self._scope_filter(
+            workspace_id, document_ids, page_number, section, page_span=page_span
+        )
 
         try:
             with self._lock:
@@ -335,17 +338,24 @@ class VectorStore:
         document_ids: Sequence[int] | None,
         page_number: int | None = None,
         section: str | None = None,
+        *,
+        page_span: tuple[int, int] | None = None,
     ) -> dict[str, Any]:
         """Build the Chroma `where` clause.
 
-        `workspace_id` is unconditional. `document_ids` and `page_number` only ever
-        narrow WITHIN an already-scoped workspace, so neither can be used to escape
-        the boundary.
+        `workspace_id` is unconditional. `document_ids`, `page_number` and
+        `page_span` only ever narrow WITHIN an already-scoped workspace, so none of
+        them can be used to escape the boundary.
 
         Page matching accepts a chunk that STARTS on the page or ENDS on it. Chunks
         can span a page boundary - a passage beginning on page 2 and finishing on
         page 3 is legitimately part of both - and matching only `page_number` would
         hide it from a question about page 3.
+
+        `page_span` is the same coverage test applied to a RANGE: a chunk belongs to
+        "pages 20-22" when it starts at or before the range's end and ends at or
+        after its start. A chunk covering pages 19-21 overlaps the requested range
+        and is included; a chunk entirely outside it is not.
         """
         conditions: list[dict[str, Any]] = [{"workspace_id": int(workspace_id)}]
 
@@ -367,6 +377,17 @@ class VectorStore:
                     "$and": [
                         {"page_number": {"$lte": target}},
                         {"page_end": {"$gte": target}},
+                    ]
+                }
+            )
+
+        if page_span is not None:
+            first, last = int(page_span[0]), int(page_span[1])
+            conditions.append(
+                {
+                    "$and": [
+                        {"page_number": {"$lte": last}},
+                        {"page_end": {"$gte": first}},
                     ]
                 }
             )

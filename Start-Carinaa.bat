@@ -104,7 +104,7 @@ start "Carinaa server" /min "%PY%" -m uvicorn app.main:app --host 127.0.0.1 --po
 rem ping, not timeout: `timeout` refuses to run when stdin is redirected (which
 rem happens whenever this file is run from another script or a scheduled task).
 ping -n 5 127.0.0.1 >nul
-start "" http://127.0.0.1:8000/
+start "" http://127.0.0.1:8000/app
 echo.
 echo   Carinaa is starting:  http://127.0.0.1:8000
 echo   Server window with the logs, and the way to stop it: the minimized

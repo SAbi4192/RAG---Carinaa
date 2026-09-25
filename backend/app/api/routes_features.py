@@ -25,6 +25,7 @@ from app.core.deps import CurrentUser, DbSession
 from app.core.errors import NotFound
 from app.core.logging import get_logger
 from app.db.models import AnswerVariant, Conversation, Message
+from app.features.detailed import generate_detailed_answer
 from app.features.languages import as_list as languages_as_list
 from app.features.languages import get_language
 from app.features.read_aloud import prepare_speech
@@ -32,8 +33,9 @@ from app.features.shorten import level_options, shorten_answer
 from app.features.translate import translate_answer, translate_text
 from app.llm.adapter import get_llm_adapter
 from app.llm.base import LLMError
-from app.rag.prompts import build_explain_messages
+from app.rag.prompts import answer_style_options, build_explain_messages
 from app.schemas.chat import (
+    DetailedAnswerRequest,
     ExplainOut,
     ExplainRequest,
     LanguagesOut,
@@ -67,6 +69,26 @@ def _require_message(db: DbSession, user: CurrentUser, message_id: int) -> Messa
 def _mode_for(db: DbSession, message: Message) -> str:
     conversation = db.get(Conversation, message.conversation_id)
     return (conversation.ai_mode if conversation else None) or settings.default_ai_mode
+
+
+def _question_for(db: DbSession, message: Message) -> str:
+    """The user turn an assistant answer belongs to (same shape as routes_chat's).
+
+    Needed by the Detailed Answer endpoint, which rebuilds the generation prompt:
+    the question text is not stored on the assistant row, and importing the twin
+    helper from routes_chat would tie two route modules together for one SELECT.
+    """
+    previous = db.scalars(
+        select(Message)
+        .where(
+            Message.conversation_id == message.conversation_id,
+            Message.role == "user",
+            Message.id <= message.id,
+        )
+        .order_by(Message.id.desc())
+        .limit(1)
+    ).first()
+    return (previous.content or "") if previous else ""
 
 
 def _resolve_mode(db: DbSession, user: CurrentUser, requested: str | None) -> str:
@@ -119,6 +141,9 @@ def capabilities() -> dict:
             "sends_data_externally": False,
         },
         "explain": {"enabled": True, "mode": "learning"},
+        # The Detailed Answer menu the toolbar renders, served so the labels and
+        # the set of styles cannot drift between the UI and the prompts.
+        "answer_styles": answer_style_options(),
         "note": (
             "All four are presentation transforms. None of them modifies the canonical "
             "grounded answer or re-runs retrieval."
@@ -212,6 +237,45 @@ async def shorten(payload: ShortenRequest, user: CurrentUser, db: DbSession) -> 
             "original_length": outcome.original_length,
             "output_length": outcome.output_length,
         },
+        provider=outcome.provider,
+        model=outcome.model,
+        cached=outcome.cached,
+        warning=outcome.warning,
+        original_unchanged=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Detailed Answer (exam-style re-presentation)
+# ---------------------------------------------------------------------------
+@router.post("/detailed-answer", response_model=VariantOut)
+async def detailed_answer(
+    payload: DetailedAnswerRequest, user: CurrentUser, db: DbSession
+) -> VariantOut:
+    """Re-present a stored answer in an exam-shaped format.
+
+    Retrieval is NOT re-run: the variant is built from exactly the evidence the
+    original answer was grounded in, so its citations remain the original
+    citations and the canonical answer stays immutable.
+    """
+    message = _require_message(db, user, payload.message_id)
+    mode = _mode_for(db, message)
+    question = _question_for(db, message)
+
+    outcome = await generate_detailed_answer(
+        db, message=message, question=question, style=payload.style, mode=mode
+    )
+
+    return VariantOut(
+        message_id=message.id,
+        kind="detailed",
+        language="en",
+        level=outcome.style,
+        content=outcome.content,
+        # The variant resolved its OWN citations against the original evidence;
+        # those are what the UI should render while the variant is showing.
+        citations=outcome.citations or message.citations or [],
+        validation=outcome.validation,
         provider=outcome.provider,
         model=outcome.model,
         cached=outcome.cached,
@@ -385,18 +449,18 @@ def list_variants(message_id: int, user: CurrentUser, db: DbSession) -> list[Var
             original_unchanged=True,
         )
         for row in rows
-        if row.kind in ("translated", "shortened")
+        if row.kind in ("translated", "shortened", "detailed")
     ]
 
 
 @router.delete("/messages/{message_id}/variants", status_code=status.HTTP_204_NO_CONTENT)
 def clear_variants(message_id: int, user: CurrentUser, db: DbSession) -> None:
-    """Forget cached translations and shortenings for this message."""
+    """Forget cached transforms (translations, shortenings, detailed answers)."""
     message = _require_message(db, user, message_id)
     rows = db.scalars(
         select(AnswerVariant).where(
             AnswerVariant.message_id == message.id,
-            AnswerVariant.kind.in_(("translated", "shortened")),
+            AnswerVariant.kind.in_(("translated", "shortened", "detailed")),
         )
     ).all()
     for row in rows:

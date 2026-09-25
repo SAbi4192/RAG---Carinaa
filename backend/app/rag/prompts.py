@@ -98,9 +98,11 @@ _DEPTH_GUIDANCE: dict[str, str] = {
     ),
     "standard": (
         "ANSWER DEPTH: STANDARD.\n"
-        "The question asks for an explanation. Answer in 1-3 short paragraphs (or a "
-        "lead paragraph plus one compact list) covering the what, the how and the "
-        "why at the depth the question implies. Be complete, not exhaustive."
+        "The question asks for an explanation. Lead with the direct answer in one "
+        "clear sentence, then explain the what, the how and the why in 2-4 short "
+        "paragraphs (or a lead paragraph plus one compact list), adding the "
+        "important details and a concrete example where the evidence contains one. "
+        "Be complete, not exhaustive: every paragraph must earn its place."
     ),
     "detailed": (
         "ANSWER DEPTH: DETAILED.\n"
@@ -112,6 +114,115 @@ _DEPTH_GUIDANCE: dict[str, str] = {
         "inventing anything the excerpts do not support."
     ),
 }
+
+# ===========================================================================
+# Detailed Answer styles (answer transformation, not a second pipeline)
+# ===========================================================================
+# The answer card's "Detailed Answer" menu asks for the SAME evidence presented in
+# an exam-shaped format. These are STYLE blocks appended to the user message (the
+# same place _DEPTH_GUIDANCE lives), and they share its one hard rule: structure
+# and length never license invention. A heading the CONTEXT cannot support is
+# dropped, not filled with plausible-sounding padding - a university answer built
+# on fabricated points is worse than a short honest one.
+#
+# Target lengths are guidance for the model, not hard word budgets: the honest cap
+# is whatever the evidence can support. When the excerpts only cover three of the
+# suggested sections, the answer has three sections.
+ANSWER_STYLES: dict[str, dict[str, Any]] = {
+    "more_detail": {
+        "label": "More Detail",
+        "max_tokens": 1600,
+        "temperature": 0.2,
+        "guidance": (
+            "ANSWER STYLE: MORE DETAIL.\n"
+            "Expand the answer moderately. Keep the direct answer first, then add "
+            "explanation, relevant context, clarifications and the useful details the "
+            "CONTEXT supports. Do not repeat the same point in different words to look "
+            "longer, and do not add filler - every paragraph must carry information "
+            "that was not already stated."
+        ),
+    },
+    "mark8": {
+        "label": "8-Mark Answer",
+        "max_tokens": 2000,
+        "temperature": 0.2,
+        "guidance": (
+            "ANSWER STYLE: 8-MARK UNIVERSITY ANSWER.\n"
+            "Write a formal, exam-ready answer of roughly 250-400 words suitable for "
+            "an 8-mark question, using ONLY these headings, in order, and only the "
+            "ones the CONTEXT can support:\n"
+            "### Introduction\n### Definition / Meaning\n### Main Explanation\n"
+            "### Key Points\n### Example\n### Conclusion\n"
+            "Under Key Points use a short bullet list. The example must come from the "
+            "CONTEXT; if the evidence contains no example, omit the Example heading "
+            "rather than inventing one. Use formal academic language. Cite every "
+            "factual claim with [n]."
+        ),
+    },
+    "mark16": {
+        "label": "16-Mark Answer",
+        "max_tokens": 3600,
+        "temperature": 0.2,
+        "guidance": (
+            "ANSWER STYLE: 16-MARK UNIVERSITY ANSWER.\n"
+            "Write a substantial, formal, exam-ready answer of roughly 600-900 words "
+            "for a 16-mark question. Draw sections from this list and include ONLY the "
+            "ones the CONTEXT supports, in an order that reads logically:\n"
+            "### Introduction\n### Definition / Concept\n### Detailed Explanation\n"
+            "### Types / Components\n### Working / Process\n### Advantages\n"
+            "### Limitations\n### Applications\n### Example\n### Conclusion\n"
+            "Never force an irrelevant heading: if the evidence says nothing about "
+            "advantages, there is no Advantages section. Sub-headings (####) are "
+            "allowed inside Detailed Explanation. Use formal academic language and "
+            "structured bullet points where they aid scanning. Cite every factual "
+            "claim with [n]. No padding, no repetition, no invented facts."
+        ),
+    },
+    "mark20": {
+        "label": "20-Mark Answer",
+        "max_tokens": 4800,
+        "temperature": 0.2,
+        "guidance": (
+            "ANSWER STYLE: 20-MARK UNIVERSITY ANSWER.\n"
+            "Write a comprehensive, formal, exam-ready answer of roughly 900-1300 "
+            "words for a 20-mark long question. Draw sections from this list and "
+            "include ONLY the ones the CONTEXT supports, ordered logically:\n"
+            "### Introduction\n### Definition\n### Detailed Explanation\n"
+            "### Types / Components\n### Process / Working\n### Advantages\n"
+            "### Disadvantages / Limitations\n### Applications\n### Examples\n"
+            "### Conclusion\n"
+            "Use #### sub-headings inside the major sections where the evidence has "
+            "distinct sub-topics. Each section must be developed from the CONTEXT, "
+            "not stretched: a section with nothing to say is omitted entirely rather "
+            "than filled with generalities. Formal academic register throughout, "
+            "structured points, and a [n] citation after every factual claim."
+        ),
+    },
+    "university": {
+        "label": "University Style",
+        "max_tokens": 3600,
+        "temperature": 0.2,
+        "guidance": (
+            "ANSWER STYLE: UNIVERSITY LONG ANSWER.\n"
+            "Write a well-organised long answer suitable for an assignment, study "
+            "notes or exam revision: formal academic language, clear headings and "
+            "sub-headings chosen for THIS topic (not a fixed template), explicit "
+            "definitions of key terms, a logical explanation that builds step by "
+            "step, worked examples or concrete details wherever the CONTEXT "
+            "provides them, structured bullet points for lists, and a short "
+            "conclusion. Length follows the evidence: cover the topic properly "
+            "without padding. Cite every factual claim with [n]."
+        ),
+    },
+}
+
+
+def answer_style_options() -> list[dict[str, str]]:
+    """The menu the frontend renders, so labels cannot drift from the server."""
+    return [
+        {"style": key, "label": value["label"]}
+        for key, value in ANSWER_STYLES.items()
+    ]
 
 # ===========================================================================
 # Generation
@@ -282,6 +393,7 @@ def build_generation_messages(
     mode: str = "online",
     history: list[dict[str, str]] | None = None,
     answer_depth: str | None = None,
+    answer_style: str | None = None,
 ) -> list[dict[str, str]]:
     """Assemble the message list sent to the LLM.
 
@@ -298,6 +410,12 @@ def build_generation_messages(
     `classify_answer_depth`). It is applied to ONLINE mode only: the offline
     prompt's framing lines were tuned against the 3B model to stop it refusing,
     and adding rules to that prompt is exactly what brought the refusals back.
+
+    `answer_style` requests a named presentation format from the Detailed Answer
+    menu (see ANSWER_STYLES). It replaces the depth block - a style IS a depth
+    decision plus a shape - and, like depth, is online-only for the same measured
+    reason: the small local model follows short instructions, and an exam template
+    is not a short instruction.
     """
     context = build_context_block(excerpts)
 
@@ -365,7 +483,11 @@ def build_generation_messages(
         # before answering. The style block in the system prompt stays untouched
         # so an online prompt's shape test cannot break.
         sections.append("")
-        sections.append(_DEPTH_GUIDANCE.get(depth, _DEPTH_GUIDANCE["standard"]))
+        style = ANSWER_STYLES.get((answer_style or "").strip().lower())
+        if style is not None:
+            sections.append(style["guidance"])
+        else:
+            sections.append(_DEPTH_GUIDANCE.get(depth, _DEPTH_GUIDANCE["standard"]))
 
     if mode == "offline":
         # These lines are the part that actually fixed offline mode. See the note

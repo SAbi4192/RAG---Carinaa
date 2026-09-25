@@ -181,7 +181,12 @@ def test_stream_done_frame_is_the_canonical_answer(client, seeded, monkeypatch) 
     assert done["answer"] == "".join(pipeline.fragments)
     assert done["message"]["content"] == "".join(pipeline.fragments)
     assert done["message"]["role"] == "assistant"
-    assert done["message"]["provider"] == "groq"
+    # Public provenance is a ROLE, not a vendor: the fake ran as "groq" internally,
+    # and nothing on the wire may say so.
+    assert done["message"]["provider"] == "remote"
+    assert done["message"]["model"] == ""
+    assert done["provider_label"] == "Remote answer engine"
+    assert "groq" not in json.dumps(done)
     assert done["trace"]["stages"]
     assert any(s["stage"] == "rrf_fusion" for s in done["trace"]["stages"])
 

@@ -20,9 +20,10 @@ import { useAskRun } from "./useAskRun";
  * citation resolved to.
  *
  * The point is that an answer on its own is not trustworthy. The same sentence is
- * a different claim depending on whether it came from Gemini, from the Groq
- * fallback, or from the offline extractive fail-safe - and the UI says which,
- * every time.
+ * a different claim depending on whether it came from the primary remote engine,
+ * from the fallback engine, or from the offline extractive fail-safe - and the
+ * UI says which, every time. Cloud vendor identity is never shown (see backend
+ * app/core/sanitize.py); only the role is.
  */
 export default function GenerationLab() {
   const { activeId } = useWorkspaces();
@@ -52,7 +53,8 @@ export default function GenerationLab() {
             You would get the raw chunks back — accurate and unreadable as an answer.
           </Concept>
           <Concept label="An answer is not self-justifying">
-            The same sentence means different things depending on whether Gemini, the Groq fallback,
+            The same sentence means different things depending on whether the primary
+            engine, the fallback engine,
             or the offline extractive fail-safe produced it. The label below always says which.
           </Concept>
           <div className="rounded-lg border border-line bg-sunken px-3 py-2">

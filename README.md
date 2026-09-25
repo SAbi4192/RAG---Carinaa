@@ -106,7 +106,109 @@ system.
 
 ---
 
-## Quick start
+## Carinaa Quick Start (beginner)
+
+New here? Follow these top to bottom. Marked **[REQUIRED]** must work; **[OPTIONAL]** adds a
+feature you can set up later. Carinaa runs **without any API key and without a local model** —
+in that state it is still fully usable for the Knowledge Base, RAG Trace, Laboratory and a
+grounded extractive answer; you only add a key or a model to get *generative* online/offline
+answers.
+
+### 1. Requirements **[REQUIRED]**
+
+| Tool | Check | Notes |
+| --- | --- | --- |
+| **Python 3.11+** | `python --version` | The `.venv` in this folder already has every dependency installed. |
+| **Node.js 20+** | `node --version` | Only needed to *rebuild* the UI. A working `frontend/dist` is already committed, so you can run Carinaa without touching Node. |
+| **Git** | `git --version` | To clone. |
+
+You do **not** need to install Python packages yourself — the project ships a ready virtual
+environment at `.venv/`.
+
+### 2. Clone **[REQUIRED]**
+
+```bash
+git clone https://github.com/SAbi4192/RAG---Carinaa.git
+cd "RAG - Carinaa"
+```
+
+### 3. Backend setup **[REQUIRED]**
+
+Already done by the committed `.venv`. To (re)install deps yourself, from the project root:
+
+```bash
+.venv/Scripts/python.exe -m pip install -r backend/requirements.txt
+```
+
+### 4. Frontend setup **[OPTIONAL — only if you change UI code]**
+
+A built copy is committed, so skip this for normal use. To rebuild after editing `frontend/src`:
+
+```bash
+cd frontend
+node node_modules/typescript/bin/tsc --noEmit
+node node_modules/vite/bin/vite.js build
+```
+
+> Use `node node_modules/...` (not `npm run build`) on this machine — npm's shim can resolve
+> against the wrong Node. See *Troubleshooting* below.
+
+### 5. Environment configuration **[OPTIONAL for basic use]**
+
+Copy the template and edit only what you want to enable:
+
+```bash
+copy .env.example .env      # Windows PowerShell: Copy-Item .env.example .env
+```
+
+Every setting has a safe default. An empty `.env` still runs the app (no remote engine, no web
+search). **Never commit your real `.env`** — it is git-ignored.
+
+### 6. Optional local model (offline mode) **[OPTIONAL]**
+
+To answer with no internet at all, place a GGUF model at `models/llm-model.gguf`. Carinaa reads
+its real name from the model's own header, so you never edit code to change it. If the file is
+absent, **offline mode shows as "not configured"** and online mode is simply used instead —
+nothing breaks.
+
+### 7. Optional: remote answer engine **[OPTIONAL]**
+
+Add at least one key in `.env` to get *generative* online answers. The engines form a primary +
+backup chain automatically; you never pick between them, and the browser never shows which
+vendor answered (by design — see *Provider privacy*).
+
+### 8. Starting Carinaa **[REQUIRED]**
+
+Easiest — double-click **`Start-Carinaa.bat`**, then open **http://127.0.0.1:8000**. Or run the
+backend directly (it also serves the built UI, one origin, no CORS):
+
+```bash
+.venv/Scripts/python.exe -m uvicorn app.main:app --port 8000 --app-dir backend
+```
+
+### First run (the 30-second check)
+
+Open http://127.0.0.1:8000 → sign up → create a workspace → upload `samples/` → ask
+*"How does virtualization improve resource utilization?"*
+
+**What Carinaa checks for you automatically** and reports in friendly words, never a stack
+trace: is the backend reachable, are the vector store and database open, are the embedding
+model and local model present, are the answer engines configured. The **Settings → Providers**
+tab shows engine status by role (primary / backup / local model) with the configured model name.
+
+### 9. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| **"only one usage of each socket address" / port 8000 busy** | A previous server is still running | Close the old "Carinaa server" window, or run on another port: `--port 8001`. |
+| **Page opens but stays black** | Browser cached the old UI shell behind the offline service worker | Hard refresh `Ctrl+Shift+R`, or DevTools → Application → Service Workers → **Unregister**, then reload. (The worker is now network-first, so this stops recurring after one reload.) |
+| `npm run build` → `MODULE_NOT_FOUND` | npm's bin shim picks the wrong Node | Use `node node_modules/vite/bin/vite.js build` instead (see step 4). |
+| Offline answer missing / "local model not configured" | No `models/llm-model.gguf` | Either add a GGUF (step 6) or use online mode — the app works without it. |
+| Online answer error "no engine configured" | No key in `.env` and no offline model | Add a key (step 7) or use the extractive/offline path. |
+| Ask about "page 22" says documents have no page info | The document is not a PDF (text/markdown/csv are not paginated) | Page questions apply to PDFs; ask plain-text documents about their content instead. |
+
+## Detailed quick start
+
 
 ### The easy way
 

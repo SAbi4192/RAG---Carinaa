@@ -29,7 +29,7 @@
 
 // Replaced at build time by the register script when it exists; harmless
 // literal default so the file works even opened directly in development.
-const VERSION = "carinaa-shell-v1";
+const VERSION = "carinaa-shell-v2";
 
 const SHELL_CACHE = `${VERSION}-shell`;
 
@@ -81,10 +81,38 @@ self.addEventListener("fetch", (event) => {
   // API and streaming always hit the network. No cache read, no cache write.
   if (isApiRequest(url)) return;
 
-  // Same-origin navigation and assets: cache-first for speed, then network to
-  // refresh; but a navigation request itself (not an asset) should fall through
-  // to the network on a cache MISS so a deep link like /app/chat/7 is not turned
-  // into a 404 by an absent shell entry.
+  // NAVIGATIONS ARE NETWORK-FIRST. THIS IS THE IMPORTANT RULE.
+  // The app shell is a tiny index.html that references content-hashed JS/CSS
+  // bundles. If a rebuild replaces those bundles on disk and a navigation is
+  // answered CACHE-FIRST, the browser gets the OLD index.html pointing at
+  // hashed files that no longer exist - every chunk 404s and the screen goes
+  // black. That is exactly what happened once and must never happen again.
+  // So: a navigation always asks the network for fresh HTML, and only falls
+  // back to the cached shell when offline. Static assets below stay cache-first
+  // for speed - that is safe, because a fresh HTML names NEW hashed filenames
+  // that are not in cache yet, so the genuinely-new files always reach the
+  // network, and the old ones are simply never referenced again.
+  if (request.mode === "navigate") {
+    event.respondWith(
+      (async () => {
+        try {
+          const response = await fetch(request);
+          const copy = response.clone();
+          const cache = await caches.open(SHELL_CACHE);
+          cache.put("/index.html", copy);
+          return response;
+        } catch (cause) {
+          /* Offline on a cold navigation: hand back the cached shell root. */
+          const shell = await caches.match("/index.html");
+          if (shell) return shell;
+          throw cause;
+        }
+      })(),
+    );
+    return;
+  }
+
+  // Same-origin assets: cache-first (content-hashed, so safe), then network.
   event.respondWith(
     (async () => {
       const cached = await caches.match(request);
@@ -109,11 +137,6 @@ self.addEventListener("fetch", (event) => {
         }
         return response;
       } catch (cause) {
-        /* Offline on a cold navigation: hand back the cached shell root. */
-        if (request.mode === "navigate") {
-          const shell = await caches.match("/index.html");
-          if (shell) return shell;
-        }
         throw cause;
       }
     })(),

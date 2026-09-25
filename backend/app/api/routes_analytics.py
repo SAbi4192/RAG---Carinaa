@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from app.core.deps import CurrentUser, DbSession
 from app.core.errors import NotFound
 from app.core.logging import get_logger
+from app.core.sanitize import public_provenance
 from app.db.models import Conversation, Document, Message, QueryLog, Workspace
 from app.evaluation.metrics import evaluate_generation
 from app.rag.grounding import STATUS_LABELS
@@ -209,7 +210,16 @@ def retrieval_metrics(
     provider_counts: dict[str, int] = {}
     mode_counts: dict[str, int] = {}
     for row in rows:
-        key = row["provider"] or "unknown"
+        # Aggregate by PUBLIC role, never by cloud vendor: analytics is a user-facing
+        # view, so "groq: 12" must never appear. The QueryLog keeps the real
+        # provenance for developers who query the database directly.
+        _public_provider, _public_model = public_provenance(row["provider"], row["model"])
+        if (row["model"] or "") == "extractive":
+            key = "Extractive (no model)"
+        elif _public_provider == "local":
+            key = "Local model"
+        else:
+            key = "Remote answer engine"
         provider_counts[key] = provider_counts.get(key, 0) + 1
         mode_counts[row["ai_mode"]] = mode_counts.get(row["ai_mode"], 0) + 1
 
@@ -266,8 +276,7 @@ def retrieval_metrics(
         "web_searches": web_searches,
         "recent": [
             {
-                "provider": row["provider"],
-                "model": row["model"],
+                "provider": public_provenance(row["provider"], row["model"])[0],
                 "ai_mode": row["ai_mode"],
                 "grounding_status": row["grounding_status"],
                 "top_score": round(row["top_score"], 4),
